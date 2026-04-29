@@ -1,5 +1,6 @@
 package duckduck.flashback3000.record;
 
+import net.minecraft.network.protocol.BundleDelimiterPacket;
 import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.common.ClientboundCustomReportDetailsPacket;
 import net.minecraft.network.protocol.common.ClientboundDisconnectPacket;
@@ -69,6 +70,7 @@ public final class IgnoredPackets {
     private IgnoredPackets() {}
 
     public static boolean isIgnored(Packet<?> packet) {
+        if (packet instanceof BundleDelimiterPacket) return true;
         return IGNORED.contains(packet.getClass());
     }
 
