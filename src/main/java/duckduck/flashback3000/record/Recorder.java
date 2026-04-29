@@ -115,12 +115,15 @@ public class Recorder {
     private SnapshotPhase snapshotPhase = SnapshotPhase.NEEDED;
     private int snapshotDrainTicks = 0;
     /**
-     * How many server ticks we keep snapshotCaptureBuffer active after triggering ME re-pair.
-     * ModelEngine's spawn pipeline takes ~3 ticks (sync, async, render) to fully resolve
-     * a newly-tracking player and emit the pivot/passenger bundle; 6 gives a safety margin.
+     * Total ticks to leave snapshotCaptureBuffer armed. ME's pivot/passenger spawn requires
+     * a transition (untracked → tracked) detected by its syncUpdate, then asyncUpdate moves
+     * the player into startTracking, then a render cycle emits the bundle. We split the
+     * re-pair across ticks: removePlayer at tick 0, updatePlayer at ME_RE_ADD_TICK, then
+     * we keep capturing until the rest of ME's pipeline drains.
      */
-    private static final int SNAPSHOT_DRAIN_TICKS = 6;
-    private int currentSnapshotPivotIdMin = 0;
+    private static final int ME_RE_ADD_TICK = 2;
+    private static final int SNAPSHOT_DRAIN_TICKS = 10;
+    private java.util.List<net.minecraft.server.level.ChunkMap.TrackedEntity> meEntitiesPendingReAdd = null;
 
     public Recorder(org.bukkit.entity.Player bukkitPlayer, Path recordFolder, String name) {
         this.bukkitPlayer = bukkitPlayer;
@@ -209,6 +212,17 @@ public class Recorder {
                 }
                 case DRAINING -> {
                     this.snapshotDrainTicks++;
+                    if (this.snapshotDrainTicks == ME_RE_ADD_TICK && this.meEntitiesPendingReAdd != null) {
+                        // ModelEngine has had a tick to observe the un-pair and queue
+                        // stopTracking. Re-pair now so the transition flips back and ME's
+                        // next render cycle emits the pivot/passengers spawn bundle.
+                        for (net.minecraft.server.level.ChunkMap.TrackedEntity te : this.meEntitiesPendingReAdd) {
+                            try { te.updatePlayer(this.serverPlayer); } catch (Throwable t) {
+                                Flashback3000.getInstance().getLogger().warning("updatePlayer failed: " + t);
+                            }
+                        }
+                        this.meEntitiesPendingReAdd = null;
+                    }
                     if (this.snapshotDrainTicks >= SNAPSHOT_DRAIN_TICKS) {
                         this.finalizeSnapshot();
                         this.snapshotPhase = SnapshotPhase.COMPLETE;
@@ -464,13 +478,14 @@ public class Recorder {
             return;
         }
 
-        // Trigger ME-aware spawn flow: un-pair then re-pair the entity tracker so the server
-        // tracker emits AddEntity etc. through the netty pipeline, ME's handler runs, and ME's
-        // own per-tick render cycle queues a pivot/passengers spawn for our player. We can't
-        // drain synchronously here (ME's spawn is multi-tick — sync, async, render); instead
-        // we leave snapshotCaptureBuffer ARMED and let the next several server ticks accumulate
-        // every outbound packet ME emits. finalizeSnapshot() runs after the drain window and
-        // bakes the captured packets into the snapshot block.
+        // Trigger ME-aware spawn flow: un-pair the tracker now, then RE-pair on a later tick
+        // (ME_RE_ADD_TICK in the DRAINING phase). The split is required because ModelEngine's
+        // BukkitEntityData.syncUpdate detects tracking transitions by diffing the previous
+        // tick's syncTracking set against the current NMS seenBy; if removePlayer and
+        // updatePlayer happen in the same tick, no transition is observed and DisplayParser
+        // never emits the pivot/passengers spawn bundle for our player. snapshotCaptureBuffer
+        // stays armed across the drain window so ME's bundle (emitted ~3 ticks after the
+        // re-pair) lands in the snapshot.
         if (!meEntities.isEmpty() && this.channel != null) {
             java.util.List<Packet<?>> captured = java.util.Collections.synchronizedList(new ArrayList<>());
             this.snapshotCaptureBuffer = captured;
@@ -479,11 +494,7 @@ public class Recorder {
                     Flashback3000.getInstance().getLogger().warning("removePlayer failed: " + t);
                 }
             }
-            for (net.minecraft.server.level.ChunkMap.TrackedEntity te : meEntities) {
-                try { te.updatePlayer(this.serverPlayer); } catch (Throwable t) {
-                    Flashback3000.getInstance().getLogger().warning("updatePlayer failed: " + t);
-                }
-            }
+            this.meEntitiesPendingReAdd = meEntities;
         }
     }
 
