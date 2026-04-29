@@ -337,10 +337,15 @@ public class Recorder {
             // so we drop them from the snapshot too — otherwise the recording shows the
             // raw cow/zombie underneath the model.
             if (ModelEngineCompat.shouldHideBase(entity)) continue;
-            int dx = entity.chunkPosition().x - centerPos.x;
-            int dz = entity.chunkPosition().z - centerPos.z;
-            int range = Math.max(viewDistance, entity.getType().clientTrackingRange());
-            if (Math.abs(dx) > range || Math.abs(dz) > range) continue;
+            // Display entities (Item/Block/Text) carry custom models and use a per-instance
+            // view range that the static EntityType.clientTrackingRange doesn't reflect.
+            // Always include them so ModelEngine model parts aren't culled out of snapshots.
+            if (!(entity instanceof net.minecraft.world.entity.Display)) {
+                int dx = entity.chunkPosition().x - centerPos.x;
+                int dz = entity.chunkPosition().z - centerPos.z;
+                int range = Math.max(viewDistance, entity.getType().clientTrackingRange());
+                if (Math.abs(dx) > range || Math.abs(dz) > range) continue;
+            }
             try {
                 net.minecraft.server.level.ServerEntity se = new net.minecraft.server.level.ServerEntity(
                         level, entity, 0, false, noopSync, java.util.Set.of());
