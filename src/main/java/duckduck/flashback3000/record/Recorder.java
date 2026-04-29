@@ -7,6 +7,7 @@ import duckduck.flashback3000.Flashback3000;
 import duckduck.flashback3000.action.ActionCreateLocalPlayer;
 import duckduck.flashback3000.action.ActionMoveEntities;
 import duckduck.flashback3000.action.ActionNextTick;
+import duckduck.flashback3000.compat.ModelEngineCompat;
 import duckduck.flashback3000.io.AsyncReplaySaver;
 import duckduck.flashback3000.io.ReplayWriter;
 import duckduck.flashback3000.netty.PacketCaptureHandler;
@@ -332,6 +333,10 @@ public class Recorder {
         for (Entity entity : level.getEntities().getAll()) {
             if (entity == this.serverPlayer) continue;
             if (shouldIgnoreEntity(entity)) continue;
+            // ModelEngine fully suppresses packets for entities whose base mob is hidden,
+            // so we drop them from the snapshot too — otherwise the recording shows the
+            // raw cow/zombie underneath the model.
+            if (ModelEngineCompat.shouldHideBase(entity)) continue;
             int dx = entity.chunkPosition().x - centerPos.x;
             int dz = entity.chunkPosition().z - centerPos.z;
             int range = Math.max(viewDistance, entity.getType().clientTrackingRange());
@@ -408,6 +413,7 @@ public class Recorder {
             // Local player is included so their position tracks during playback. Their entity
             // id matches what the snapshot's create_local_player action assigned.
             if (shouldIgnoreEntity(entity)) continue;
+            if (entity != this.serverPlayer && ModelEngineCompat.shouldHideBase(entity)) continue;
             net.minecraft.world.phys.Vec3 pos = entity.trackingPosition();
             EntityPos current = new EntityPos(entity.getId(),
                     pos.x, pos.y, pos.z,
