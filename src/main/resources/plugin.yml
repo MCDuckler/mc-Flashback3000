@@ -1,0 +1,15 @@
+name: Flashback3000
+version: '${project.version}'
+main: duckduck.flashback3000.Flashback3000
+api-version: '1.21'
+load: STARTUP
+commands:
+  flashback:
+    description: Manage server-side Flashback recordings
+    aliases: [fb]
+    usage: /flashback start|stop|list|cancel [player]
+    permission: flashback3000.admin
+permissions:
+  flashback3000.admin:
+    description: Allows managing Flashback3000 recordings
+    default: op
