@@ -320,7 +320,7 @@ public class Recorder {
                 LevelChunk chunk = level.getChunkSource().getChunkNow(cx, cz);
                 if (chunk == null) continue;
                 if (!seen.add(ChunkPos.asLong(cx, cz))) continue;
-                gamePackets.add(new ClientboundLevelChunkWithLightPacket(chunk, lightEngine, new java.util.BitSet(), new java.util.BitSet()));
+                gamePackets.add(new ClientboundLevelChunkWithLightPacket(chunk, lightEngine, null, null));
             }
         }
 
@@ -334,7 +334,8 @@ public class Recorder {
             if (shouldIgnoreEntity(entity)) continue;
             int dx = entity.chunkPosition().x - centerPos.x;
             int dz = entity.chunkPosition().z - centerPos.z;
-            if (Math.abs(dx) > viewDistance || Math.abs(dz) > viewDistance) continue;
+            int range = Math.max(viewDistance, entity.getType().clientTrackingRange());
+            if (Math.abs(dx) > range || Math.abs(dz) > range) continue;
             try {
                 net.minecraft.server.level.ServerEntity se = new net.minecraft.server.level.ServerEntity(
                         level, entity, 0, false, noopSync, java.util.Set.of());
@@ -404,7 +405,8 @@ public class Recorder {
         ServerLevel level = this.serverPlayer.level();
         List<EntityPos> changed = new ArrayList<>();
         for (Entity entity : level.getEntities().getAll()) {
-            if (entity == this.serverPlayer) continue;
+            // Local player is included so their position tracks during playback. Their entity
+            // id matches what the snapshot's create_local_player action assigned.
             if (shouldIgnoreEntity(entity)) continue;
             net.minecraft.world.phys.Vec3 pos = entity.trackingPosition();
             EntityPos current = new EntityPos(entity.getId(),
