@@ -457,11 +457,19 @@ public class Recorder {
             try {
                 if (entity == this.serverPlayer) continue;
                 if (shouldIgnoreEntity(entity)) continue;
-                if (ModelEngineCompat.shouldHideBase(entity)) continue;
 
-                if (chunkMap != null && ModelEngineCompat.isMERelated(entity)) {
-                    net.minecraft.server.level.ChunkMap.TrackedEntity te = chunkMap.entityMap.get(entity.getId());
-                    if (te != null) meEntities.add(te);
+                // ModelEngine-related entities (incl. hidden bases): re-pair via the netty
+                // pipeline so ME's syncUpdate detects the start-tracking transition and
+                // DisplayParser.spawn fires the pivot/displays/SetPassengers bundle.
+                // Hidden bases STILL need re-pair — that's the only way ME emits the bundle
+                // we care about. We just don't manually emit AddEntity for them.
+                boolean isModeled = ModelEngineCompat.isMERelated(entity);
+                boolean hiddenBase = ModelEngineCompat.shouldHideBase(entity);
+                if (isModeled || hiddenBase) {
+                    if (chunkMap != null) {
+                        net.minecraft.server.level.ChunkMap.TrackedEntity te = chunkMap.entityMap.get(entity.getId());
+                        if (te != null) meEntities.add(te);
+                    }
                     continue;
                 }
 
