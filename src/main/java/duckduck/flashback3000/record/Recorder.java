@@ -111,6 +111,14 @@ public class Recorder {
     private final ConcurrentLinkedQueue<Packet<?>> deferredFromLastTick = new ConcurrentLinkedQueue<>();
     private final AtomicReference<Throwable> capturedError = new AtomicReference<>();
     private final java.util.WeakHashMap<Entity, EntityPos> lastPositions = new java.util.WeakHashMap<>();
+    /**
+     * Vehicle entity id → list of direct passenger ids, learned from captured
+     * ClientboundSetPassengersPacket. Used to synthesize per-passenger teleport packets
+     * when the vehicle moves: Flashback's playback doesn't seem to update Display
+     * passenger positions from their AreaEffectCloud vehicle's tick, so models stay at
+     * their AddEntity spawn position even though the pivot moves correctly.
+     */
+    private final java.util.Map<Integer, int[]> vehicleToPassengers = new java.util.concurrent.ConcurrentHashMap<>();
 
     /**
      * When non-null, captured outbound packets land here instead of pendingPackets.
@@ -299,6 +307,7 @@ public class Recorder {
             Packet<? super ClientGamePacketListener> casted = (Packet<? super ClientGamePacketListener>) p;
             gamePackets.add(casted);
         }
+        injectPassengerTeleports(gamePackets);
         this.asyncReplaySaver.writeGamePackets(this.gamePacketCodec, gamePackets);
     }
 
@@ -309,9 +318,52 @@ public class Recorder {
         while ((p = this.deferredFromLastTick.poll()) != null) {
             @SuppressWarnings("unchecked")
             Packet<? super ClientGamePacketListener> casted = (Packet<? super ClientGamePacketListener>) p;
+            // Update vehicle→passenger map from each SetPassengers packet as we flush.
+            if (p instanceof net.minecraft.network.protocol.game.ClientboundSetPassengersPacket sp) {
+                int[] passengers = sp.getPassengers();
+                if (passengers.length == 0) {
+                    this.vehicleToPassengers.remove(sp.getVehicle());
+                } else {
+                    this.vehicleToPassengers.put(sp.getVehicle(), passengers.clone());
+                }
+            }
             gamePackets.add(casted);
         }
         this.asyncReplaySaver.writeGamePackets(this.gamePacketCodec, gamePackets);
+    }
+
+    /**
+     * Walk gamePackets and, for each ClientboundEntityPositionSyncPacket whose entity is a known
+     * vehicle, append synthesized EntityPositionSync packets for each passenger so they teleport
+     * to the same position. Resolves transitively (passengers of passengers).
+     */
+    private void injectPassengerTeleports(List<Packet<? super ClientGamePacketListener>> gamePackets) {
+        if (this.vehicleToPassengers.isEmpty()) return;
+        int originalSize = gamePackets.size();
+        for (int i = 0; i < originalSize; i++) {
+            Packet<?> orig = gamePackets.get(i);
+            if (!(orig instanceof net.minecraft.network.protocol.game.ClientboundEntityPositionSyncPacket pos)) continue;
+            int[] roots = this.vehicleToPassengers.get(pos.id());
+            if (roots == null) continue;
+            // BFS over passenger tree to support nested rigs.
+            java.util.ArrayDeque<Integer> q = new java.util.ArrayDeque<>();
+            for (int r : roots) q.add(r);
+            java.util.Set<Integer> visited = new java.util.HashSet<>();
+            visited.add(pos.id());
+            while (!q.isEmpty()) {
+                int passengerId = q.poll();
+                if (!visited.add(passengerId)) continue;
+                @SuppressWarnings("unchecked")
+                Packet<? super ClientGamePacketListener> synth = (Packet<? super ClientGamePacketListener>)
+                        (Packet<?>) new net.minecraft.network.protocol.game.ClientboundEntityPositionSyncPacket(
+                                passengerId, pos.values(), pos.onGround());
+                gamePackets.add(synth);
+                int[] subPassengers = this.vehicleToPassengers.get(passengerId);
+                if (subPassengers != null) {
+                    for (int sp : subPassengers) q.add(sp);
+                }
+            }
+        }
     }
 
     private void flushChunk(boolean closing) {
