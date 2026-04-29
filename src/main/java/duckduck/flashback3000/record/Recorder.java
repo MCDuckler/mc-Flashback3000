@@ -117,12 +117,16 @@ public class Recorder {
     /**
      * Total ticks to leave snapshotCaptureBuffer armed. ME's pivot/passenger spawn requires
      * a transition (untracked → tracked) detected by its syncUpdate, then asyncUpdate moves
-     * the player into startTracking, then a render cycle emits the bundle. We split the
-     * re-pair across ticks: removePlayer at tick 0, updatePlayer at ME_RE_ADD_TICK, then
-     * we keep capturing until the rest of ME's pipeline drains.
+     * the player into startTracking, then an async render cycle emits the bundle. We split
+     * the re-pair across ticks: removePlayer at tick 0, updatePlayer at ME_RE_ADD_TICK, then
+     * keep capturing for SNAPSHOT_DRAIN_TICKS while ME's executor pool drains its render
+     * queue. ModelUpdaters.tick chains via lastTickFuture, so a render backlog (hundreds of
+     * entities) can serialize over many ticks. 60 ticks (3s) is enough headroom for CTA-scale
+     * worlds; before finalizing we also wait on a netty event-loop marker to drain in-flight
+     * packets to our captureHandler.
      */
-    private static final int ME_RE_ADD_TICK = 2;
-    private static final int SNAPSHOT_DRAIN_TICKS = 10;
+    private static final int ME_RE_ADD_TICK = 5;
+    private static final int SNAPSHOT_DRAIN_TICKS = 60;
     private java.util.List<net.minecraft.server.level.ChunkMap.TrackedEntity> meEntitiesPendingReAdd = null;
 
     public Recorder(org.bukkit.entity.Player bukkitPlayer, Path recordFolder, String name) {
@@ -343,6 +347,16 @@ public class Recorder {
     }
 
     private void finalizeSnapshot() {
+        // Drain pending writes on the netty event loop before snapshotting captured packets:
+        // ME emits via pipeline.writeAndFlush from its executor pool, so a packet may already
+        // be queued on the event loop when this main-thread tick fires. Submitting a no-op
+        // task and awaiting it guarantees every prior write has reached our captureHandler.
+        Channel ch = this.channel;
+        if (ch != null && ch.eventLoop() != null) {
+            try {
+                ch.eventLoop().submit(() -> null).get(250, java.util.concurrent.TimeUnit.MILLISECONDS);
+            } catch (Throwable ignored) {}
+        }
         java.util.List<Packet<?>> captured = this.snapshotCaptureBuffer;
         this.snapshotCaptureBuffer = null;
         if (captured != null && !captured.isEmpty()) {
