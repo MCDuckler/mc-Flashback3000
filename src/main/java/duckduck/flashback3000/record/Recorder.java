@@ -364,33 +364,47 @@ public class Recorder {
             @Override public void sendToTrackingPlayersFiltered(Packet<? super ClientGamePacketListener> p, java.util.function.Predicate<net.minecraft.server.level.ServerPlayer> filter) {}
         };
 
-        net.minecraft.server.level.ChunkMap chunkMap = level.getChunkSource().chunkMap;
         java.util.List<net.minecraft.server.level.ChunkMap.TrackedEntity> meEntities = new ArrayList<>();
+        net.minecraft.server.level.ChunkMap chunkMap = null;
+        try {
+            chunkMap = level.getChunkSource().chunkMap;
+        } catch (Throwable t) {
+            Flashback3000.getInstance().getLogger().warning("Could not access chunkMap: " + t);
+        }
 
         for (Entity entity : level.getEntities().getAll()) {
-            if (entity == this.serverPlayer) continue;
-            if (shouldIgnoreEntity(entity)) continue;
-            if (ModelEngineCompat.shouldHideBase(entity)) continue;
-
-            if (ModelEngineCompat.isMERelated(entity)) {
-                net.minecraft.server.level.ChunkMap.TrackedEntity te = chunkMap.entityMap.get(entity.getId());
-                if (te != null) meEntities.add(te);
-                continue;
-            }
-
-            if (!(entity instanceof net.minecraft.world.entity.Display)) {
-                int dx = entity.chunkPosition().x - centerPos.x;
-                int dz = entity.chunkPosition().z - centerPos.z;
-                int range = Math.max(viewDistance, entity.getType().clientTrackingRange());
-                if (Math.abs(dx) > range || Math.abs(dz) > range) continue;
-            }
             try {
+                if (entity == this.serverPlayer) continue;
+                if (shouldIgnoreEntity(entity)) continue;
+                if (ModelEngineCompat.shouldHideBase(entity)) continue;
+
+                if (chunkMap != null && ModelEngineCompat.isMERelated(entity)) {
+                    net.minecraft.server.level.ChunkMap.TrackedEntity te = chunkMap.entityMap.get(entity.getId());
+                    if (te != null) meEntities.add(te);
+                    continue;
+                }
+
+                if (!(entity instanceof net.minecraft.world.entity.Display)) {
+                    int dx = entity.chunkPosition().x - centerPos.x;
+                    int dz = entity.chunkPosition().z - centerPos.z;
+                    int range = Math.max(viewDistance, entity.getType().clientTrackingRange());
+                    if (Math.abs(dx) > range || Math.abs(dz) > range) continue;
+                }
                 net.minecraft.server.level.ServerEntity se = new net.minecraft.server.level.ServerEntity(
                         level, entity, 0, false, noopSync, java.util.Set.of());
                 se.sendPairingData(this.serverPlayer, gamePackets::add);
             } catch (Throwable t) {
-                Flashback3000.getInstance().getLogger().fine("Skipping entity " + entity.getId() + " in snapshot: " + t);
+                Flashback3000.getInstance().getLogger().warning("Skipping entity " + entity.getId() + " in snapshot: " + t);
             }
+        }
+
+        // Submit the bulk snapshot NOW. If the ME re-pair phase below fails or times out,
+        // at least the world + vanilla entities are already in the snapshot.
+        try {
+            this.asyncReplaySaver.writeGamePackets(this.gamePacketCodec, gamePackets);
+        } catch (Throwable t) {
+            Flashback3000.getInstance().getLogger().severe("Failed to submit snapshot game packets: " + t);
+            return;
         }
 
         // Re-pair ME-related entities through the real channel pipeline so ModelEngine's
@@ -401,29 +415,37 @@ public class Recorder {
             this.snapshotCaptureBuffer = captured;
             try {
                 for (net.minecraft.server.level.ChunkMap.TrackedEntity te : meEntities) {
-                    try { te.removePlayer(this.serverPlayer); } catch (Throwable ignored) {}
+                    try { te.removePlayer(this.serverPlayer); } catch (Throwable t) {
+                        Flashback3000.getInstance().getLogger().warning("removePlayer failed: " + t);
+                    }
                 }
                 for (net.minecraft.server.level.ChunkMap.TrackedEntity te : meEntities) {
-                    try { te.updatePlayer(this.serverPlayer); } catch (Throwable ignored) {}
+                    try { te.updatePlayer(this.serverPlayer); } catch (Throwable t) {
+                        Flashback3000.getInstance().getLogger().warning("updatePlayer failed: " + t);
+                    }
                 }
-                // Drain the netty event loop so all queued writes have flowed through the
-                // pipeline and our captureHandler before we close out the snapshot.
                 try {
                     this.channel.eventLoop().submit(() -> {}).get(2, java.util.concurrent.TimeUnit.SECONDS);
                 } catch (Throwable t) {
-                    Flashback3000.getInstance().getLogger().fine("Snapshot drain timed out: " + t);
+                    Flashback3000.getInstance().getLogger().warning("Snapshot drain timed out: " + t);
                 }
             } finally {
                 this.snapshotCaptureBuffer = null;
             }
-            for (Packet<?> p : captured) {
-                @SuppressWarnings("unchecked")
-                Packet<? super ClientGamePacketListener> casted = (Packet<? super ClientGamePacketListener>) p;
-                gamePackets.add(casted);
+            if (!captured.isEmpty()) {
+                List<Packet<? super ClientGamePacketListener>> meBatch = new ArrayList<>(captured.size());
+                for (Packet<?> p : captured) {
+                    @SuppressWarnings("unchecked")
+                    Packet<? super ClientGamePacketListener> casted = (Packet<? super ClientGamePacketListener>) p;
+                    meBatch.add(casted);
+                }
+                try {
+                    this.asyncReplaySaver.writeGamePackets(this.gamePacketCodec, meBatch);
+                } catch (Throwable t) {
+                    Flashback3000.getInstance().getLogger().severe("Failed to submit ME snapshot batch: " + t);
+                }
             }
         }
-
-        this.asyncReplaySaver.writeGamePackets(this.gamePacketCodec, gamePackets);
     }
 
     private ClientboundLoginPacket buildLoginPacket(MinecraftServer server, ServerLevel level) {
