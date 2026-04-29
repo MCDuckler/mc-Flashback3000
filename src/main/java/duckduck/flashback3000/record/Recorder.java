@@ -179,6 +179,16 @@ public class Recorder {
 
     public void acceptOutboundPacket(Packet<?> packet) {
         if (this.stopped) return;
+        // Diagnostic: trace position-sync / teleport / set-passengers packets to verify ME emissions reach us
+        if (Flashback3000.DEBUG_TRACE_PACKETS) {
+            String n = packet.getClass().getSimpleName();
+            if (n.equals("ClientboundEntityPositionSyncPacket")
+                    || n.equals("ClientboundTeleportEntityPacket")
+                    || n.equals("ClientboundSetPassengersPacket")
+                    || n.equals("ClientboundAddEntityPacket")) {
+                Flashback3000.getInstance().getLogger().info("F3K capture: " + n + " (filtered=" + IgnoredPackets.isIgnored(packet) + ")");
+            }
+        }
         if (IgnoredPackets.isIgnored(packet)) return;
         if (packet instanceof ClientboundCustomPayloadPacket cp) {
             String ns = cp.payload().type().id().getNamespace();

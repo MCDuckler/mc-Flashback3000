@@ -15,6 +15,8 @@ public final class Flashback3000 extends JavaPlugin implements Listener {
 
     public static final String NAMESPACE = "flashback";
     public static final int MAGIC = 0xD780E884;
+    /** Verbose logging of ME-relevant packets reaching the captureHandler. Disable in prod. */
+    public static final boolean DEBUG_TRACE_PACKETS = true;
 
     @Getter
     private static Flashback3000 instance;
