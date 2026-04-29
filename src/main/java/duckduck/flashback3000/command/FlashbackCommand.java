@@ -32,7 +32,7 @@ public class FlashbackCommand implements CommandExecutor, TabCompleter {
     public boolean onCommand(@NotNull CommandSender sender, @NotNull Command command,
                              @NotNull String label, @NotNull String[] args) {
         if (args.length == 0) {
-            sender.sendMessage("Usage: /flashback <start|stop|cancel|list|files> [player] [name]");
+            sender.sendMessage("Usage: /flashback <start|stop|cancel|list|files|play|playstop> [...]");
             return true;
         }
         String sub = args[0].toLowerCase();
@@ -42,11 +42,51 @@ public class FlashbackCommand implements CommandExecutor, TabCompleter {
             case "cancel" -> handleCancel(sender, args);
             case "list" -> handleList(sender);
             case "files" -> handleFiles(sender);
+            case "play" -> handlePlay(sender, args);
+            case "playstop" -> handlePlayStop(sender, args);
             default -> {
                 sender.sendMessage("Unknown subcommand: " + sub);
                 yield true;
             }
         };
+    }
+
+    private boolean handlePlay(CommandSender sender, String[] args) {
+        if (args.length < 2) {
+            sender.sendMessage("Usage: /flashback play <replay-id-or-filename> [player]");
+            return true;
+        }
+        String identifier = args[1];
+        Player target = args.length > 2 ? Bukkit.getPlayerExact(args[2])
+                : (sender instanceof Player p ? p : null);
+        if (target == null) {
+            sender.sendMessage("Specify a target player.");
+            return true;
+        }
+        try {
+            java.nio.file.Path path = this.plugin.getPlaybackManager().resolveReplay(identifier);
+            if (path == null) {
+                sender.sendMessage("Replay not found: " + identifier);
+                return true;
+            }
+            this.plugin.getPlaybackManager().start(target, path);
+            sender.sendMessage("Started playback for " + target.getName() + " (" + path.getFileName() + ")");
+        } catch (Exception e) {
+            sender.sendMessage("Failed to play: " + e.getMessage());
+        }
+        return true;
+    }
+
+    private boolean handlePlayStop(CommandSender sender, String[] args) {
+        Player target = args.length > 1 ? Bukkit.getPlayerExact(args[1])
+                : (sender instanceof Player p ? p : null);
+        if (target == null) {
+            sender.sendMessage("Specify a target player.");
+            return true;
+        }
+        this.plugin.getPlaybackManager().cancel(target);
+        sender.sendMessage("Cancelled playback for " + target.getName());
+        return true;
     }
 
     private boolean handleStart(CommandSender sender, String[] args) {
@@ -144,7 +184,7 @@ public class FlashbackCommand implements CommandExecutor, TabCompleter {
     public List<String> onTabComplete(@NotNull CommandSender sender, @NotNull Command command,
                                       @NotNull String alias, @NotNull String[] args) {
         if (args.length == 1) {
-            List<String> subs = new ArrayList<>(List.of("start", "stop", "cancel", "list", "files"));
+            List<String> subs = new ArrayList<>(List.of("start", "stop", "cancel", "list", "files", "play", "playstop"));
             subs.removeIf(s -> !s.startsWith(args[0].toLowerCase()));
             return subs;
         }
