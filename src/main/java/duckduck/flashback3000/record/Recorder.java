@@ -318,30 +318,23 @@ public class Recorder {
             }
         }
 
+        net.minecraft.server.level.ServerEntity.Synchronizer noopSync = new net.minecraft.server.level.ServerEntity.Synchronizer() {
+            @Override public void sendToTrackingPlayers(Packet<? super ClientGamePacketListener> p) {}
+            @Override public void sendToTrackingPlayersAndSelf(Packet<? super ClientGamePacketListener> p) {}
+            @Override public void sendToTrackingPlayersFiltered(Packet<? super ClientGamePacketListener> p, java.util.function.Predicate<net.minecraft.server.level.ServerPlayer> filter) {}
+        };
         for (Entity entity : level.getEntities().getAll()) {
             if (entity == this.serverPlayer) continue;
             int dx = entity.chunkPosition().x - centerPos.x;
             int dz = entity.chunkPosition().z - centerPos.z;
             if (Math.abs(dx) > viewDistance || Math.abs(dz) > viewDistance) continue;
-
-            gamePackets.add(new ClientboundAddEntityPacket(
-                    entity.getId(), entity.getUUID(),
-                    entity.getX(), entity.getY(), entity.getZ(),
-                    entity.getXRot(), entity.getYRot(),
-                    entity.getType(), 0,
-                    entity.getDeltaMovement(), entity.getYHeadRot()));
-
-            var nonDefault = entity.getEntityData().getNonDefaultValues();
-            if (nonDefault != null && !nonDefault.isEmpty()) {
-                gamePackets.add(new ClientboundSetEntityDataPacket(entity.getId(), nonDefault));
+            try {
+                net.minecraft.server.level.ServerEntity se = new net.minecraft.server.level.ServerEntity(
+                        level, entity, 0, false, noopSync, java.util.Set.of());
+                se.sendPairingData(this.serverPlayer, gamePackets::add);
+            } catch (Throwable t) {
+                Flashback3000.getInstance().getLogger().fine("Skipping entity " + entity.getId() + " in snapshot: " + t);
             }
-            if (entity instanceof LivingEntity living) {
-                Collection<AttributeInstance> attrs = living.getAttributes().getSyncableAttributes();
-                if (!attrs.isEmpty()) {
-                    gamePackets.add(new ClientboundUpdateAttributesPacket(entity.getId(), attrs));
-                }
-            }
-            gamePackets.add(new ClientboundSetEntityMotionPacket(entity.getId(), entity.getDeltaMovement()));
         }
 
         this.asyncReplaySaver.writeGamePackets(this.gamePacketCodec, gamePackets);
