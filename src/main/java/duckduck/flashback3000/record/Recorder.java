@@ -109,8 +109,18 @@ public class Recorder {
 
     private int writtenTicksInChunk = 0;
     private int writtenTicks = 0;
-    private boolean needsInitialSnapshot = true;
     private volatile boolean stopped = false;
+
+    private enum SnapshotPhase { NEEDED, DRAINING, COMPLETE }
+    private SnapshotPhase snapshotPhase = SnapshotPhase.NEEDED;
+    private int snapshotDrainTicks = 0;
+    /**
+     * How many server ticks we keep snapshotCaptureBuffer active after triggering ME re-pair.
+     * ModelEngine's spawn pipeline takes ~3 ticks (sync, async, render) to fully resolve
+     * a newly-tracking player and emit the pivot/passenger bundle; 6 gives a safety margin.
+     */
+    private static final int SNAPSHOT_DRAIN_TICKS = 6;
+    private int currentSnapshotPivotIdMin = 0;
 
     public Recorder(org.bukkit.entity.Player bukkitPlayer, Path recordFolder, String name) {
         this.bukkitPlayer = bukkitPlayer;
@@ -191,18 +201,30 @@ public class Recorder {
     public void tick() {
         if (this.stopped) return;
         try {
-            if (this.needsInitialSnapshot) {
-                this.needsInitialSnapshot = false;
-                this.writeInitialSnapshot();
-            }
-            this.flushPendingPackets();
-            this.writeEntityPositions();
-            this.asyncReplaySaver.submit(w -> w.startAndFinishAction(ActionNextTick.INSTANCE));
-            this.writtenTicksInChunk++;
-            this.writtenTicks++;
+            switch (this.snapshotPhase) {
+                case NEEDED -> {
+                    this.beginSnapshot();
+                    this.snapshotPhase = SnapshotPhase.DRAINING;
+                    this.snapshotDrainTicks = 0;
+                }
+                case DRAINING -> {
+                    this.snapshotDrainTicks++;
+                    if (this.snapshotDrainTicks >= SNAPSHOT_DRAIN_TICKS) {
+                        this.finalizeSnapshot();
+                        this.snapshotPhase = SnapshotPhase.COMPLETE;
+                    }
+                }
+                case COMPLETE -> {
+                    this.flushPendingPackets();
+                    this.writeEntityPositions();
+                    this.asyncReplaySaver.submit(w -> w.startAndFinishAction(ActionNextTick.INSTANCE));
+                    this.writtenTicksInChunk++;
+                    this.writtenTicks++;
 
-            if (this.writtenTicksInChunk >= CHUNK_LENGTH_TICKS) {
-                this.flushChunk(false);
+                    if (this.writtenTicksInChunk >= CHUNK_LENGTH_TICKS) {
+                        this.flushChunk(false);
+                    }
+                }
             }
         } catch (Throwable t) {
             this.onError(t);
@@ -232,7 +254,9 @@ public class Recorder {
         this.asyncReplaySaver.writeReplayChunk(chunkName, json);
         this.writtenTicksInChunk = 0;
         if (!closing) {
-            this.writeInitialSnapshot();
+            // Restart the snapshot phase machine. The next tick will rebuild the snapshot
+            // for the new replay-chunk file.
+            this.snapshotPhase = SnapshotPhase.NEEDED;
         }
     }
 
@@ -256,6 +280,15 @@ public class Recorder {
         } catch (Throwable ignored) {}
 
         try {
+            // If we're stopping mid-snapshot (NEEDED never fired or DRAINING in progress),
+            // close out the snapshot so the chunk file isn't left with an open snapshot block.
+            if (this.snapshotPhase == SnapshotPhase.NEEDED) {
+                this.beginSnapshot();
+                this.finalizeSnapshot();
+            } else if (this.snapshotPhase == SnapshotPhase.DRAINING) {
+                this.finalizeSnapshot();
+            }
+            this.snapshotPhase = SnapshotPhase.COMPLETE;
             this.flushPendingPackets();
             if (this.writtenTicksInChunk == 0) {
                 this.asyncReplaySaver.submit(w -> w.startAndFinishAction(ActionNextTick.INSTANCE));
@@ -271,13 +304,37 @@ public class Recorder {
 
     // -------- snapshot generation --------
 
-    private void writeInitialSnapshot() {
+    private void beginSnapshot() {
         this.asyncReplaySaver.submit(ReplayWriter::startSnapshot);
         try {
             this.writeConfigurationSnapshot();
             this.writeGameSnapshot();
         } catch (Throwable t) {
+            Flashback3000.getInstance().getLogger().severe("Snapshot begin failed: " + t);
             this.onError(t);
+        }
+        // snapshotCaptureBuffer is left active by writeGameSnapshot if ME entities were
+        // re-paired. Real-time outbound packets to the player keep landing in it during
+        // the drain window — they all become part of the snapshot.
+    }
+
+    private void finalizeSnapshot() {
+        java.util.List<Packet<?>> captured = this.snapshotCaptureBuffer;
+        this.snapshotCaptureBuffer = null;
+        if (captured != null && !captured.isEmpty()) {
+            List<Packet<? super ClientGamePacketListener>> meBatch = new ArrayList<>(captured.size());
+            synchronized (captured) {
+                for (Packet<?> p : captured) {
+                    @SuppressWarnings("unchecked")
+                    Packet<? super ClientGamePacketListener> casted = (Packet<? super ClientGamePacketListener>) p;
+                    meBatch.add(casted);
+                }
+            }
+            try {
+                this.asyncReplaySaver.writeGamePackets(this.gamePacketCodec, meBatch);
+            } catch (Throwable t) {
+                Flashback3000.getInstance().getLogger().severe("Snapshot ME batch submit failed: " + t);
+            }
         }
         this.asyncReplaySaver.submit(ReplayWriter::endSnapshot);
     }
@@ -407,42 +464,24 @@ public class Recorder {
             return;
         }
 
-        // Re-pair ME-related entities through the real channel pipeline so ModelEngine's
-        // handler runs and injects the pivot/passengers tree we'd otherwise miss. The
-        // captureHandler buffers the resulting packets into snapshotCaptureBuffer.
+        // Trigger ME-aware spawn flow: un-pair then re-pair the entity tracker so the server
+        // tracker emits AddEntity etc. through the netty pipeline, ME's handler runs, and ME's
+        // own per-tick render cycle queues a pivot/passengers spawn for our player. We can't
+        // drain synchronously here (ME's spawn is multi-tick — sync, async, render); instead
+        // we leave snapshotCaptureBuffer ARMED and let the next several server ticks accumulate
+        // every outbound packet ME emits. finalizeSnapshot() runs after the drain window and
+        // bakes the captured packets into the snapshot block.
         if (!meEntities.isEmpty() && this.channel != null) {
             java.util.List<Packet<?>> captured = java.util.Collections.synchronizedList(new ArrayList<>());
             this.snapshotCaptureBuffer = captured;
-            try {
-                for (net.minecraft.server.level.ChunkMap.TrackedEntity te : meEntities) {
-                    try { te.removePlayer(this.serverPlayer); } catch (Throwable t) {
-                        Flashback3000.getInstance().getLogger().warning("removePlayer failed: " + t);
-                    }
+            for (net.minecraft.server.level.ChunkMap.TrackedEntity te : meEntities) {
+                try { te.removePlayer(this.serverPlayer); } catch (Throwable t) {
+                    Flashback3000.getInstance().getLogger().warning("removePlayer failed: " + t);
                 }
-                for (net.minecraft.server.level.ChunkMap.TrackedEntity te : meEntities) {
-                    try { te.updatePlayer(this.serverPlayer); } catch (Throwable t) {
-                        Flashback3000.getInstance().getLogger().warning("updatePlayer failed: " + t);
-                    }
-                }
-                try {
-                    this.channel.eventLoop().submit(() -> {}).get(2, java.util.concurrent.TimeUnit.SECONDS);
-                } catch (Throwable t) {
-                    Flashback3000.getInstance().getLogger().warning("Snapshot drain timed out: " + t);
-                }
-            } finally {
-                this.snapshotCaptureBuffer = null;
             }
-            if (!captured.isEmpty()) {
-                List<Packet<? super ClientGamePacketListener>> meBatch = new ArrayList<>(captured.size());
-                for (Packet<?> p : captured) {
-                    @SuppressWarnings("unchecked")
-                    Packet<? super ClientGamePacketListener> casted = (Packet<? super ClientGamePacketListener>) p;
-                    meBatch.add(casted);
-                }
-                try {
-                    this.asyncReplaySaver.writeGamePackets(this.gamePacketCodec, meBatch);
-                } catch (Throwable t) {
-                    Flashback3000.getInstance().getLogger().severe("Failed to submit ME snapshot batch: " + t);
+            for (net.minecraft.server.level.ChunkMap.TrackedEntity te : meEntities) {
+                try { te.updatePlayer(this.serverPlayer); } catch (Throwable t) {
+                    Flashback3000.getInstance().getLogger().warning("updatePlayer failed: " + t);
                 }
             }
         }
