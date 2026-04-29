@@ -37,9 +37,8 @@ import net.minecraft.network.protocol.game.ClientboundLoginPacket;
 import net.minecraft.network.protocol.game.ClientboundPlayerInfoUpdatePacket;
 import net.minecraft.network.protocol.game.ClientboundSetDefaultSpawnPositionPacket;
 import net.minecraft.network.protocol.game.ClientboundSetEntityDataPacket;
-import net.minecraft.network.protocol.game.ClientboundSetEntityMotionPacket;
+import net.minecraft.network.protocol.game.ClientboundSetEquipmentPacket;
 import net.minecraft.network.protocol.game.ClientboundSetTimePacket;
-import net.minecraft.network.protocol.game.ClientboundUpdateAttributesPacket;
 import net.minecraft.network.protocol.game.CommonPlayerSpawnInfo;
 import net.minecraft.network.protocol.game.GameProtocols;
 import net.minecraft.resources.RegistryOps;
@@ -97,6 +96,7 @@ public class Recorder {
 
     private final ConcurrentLinkedQueue<Packet<?>> pendingPackets = new ConcurrentLinkedQueue<>();
     private final AtomicReference<Throwable> capturedError = new AtomicReference<>();
+    private final java.util.WeakHashMap<Entity, EntityPos> lastPositions = new java.util.WeakHashMap<>();
 
     private int writtenTicksInChunk = 0;
     private int writtenTicks = 0;
@@ -161,6 +161,12 @@ public class Recorder {
             String ns = cp.payload().type().id().getNamespace();
             if (duckduck.flashback3000.protocol.PacketIds.CHANNEL_NAMESPACE.equals(ns)) return;
         }
+        // Drop packets targeting the recording player's own entity — the local-player view is
+        // reconstructed by the snapshot + create_local_player action, so per-tick mutations
+        // would double up and flicker on playback.
+        int selfId = this.serverPlayer.getId();
+        if (packet instanceof ClientboundSetEntityDataPacket data && data.id() == selfId) return;
+        if (packet instanceof ClientboundSetEquipmentPacket equip && equip.getEntity() == selfId) return;
         this.pendingPackets.add(packet);
     }
 
@@ -314,7 +320,7 @@ public class Recorder {
                 LevelChunk chunk = level.getChunkSource().getChunkNow(cx, cz);
                 if (chunk == null) continue;
                 if (!seen.add(ChunkPos.asLong(cx, cz))) continue;
-                gamePackets.add(new ClientboundLevelChunkWithLightPacket(chunk, lightEngine, null, null));
+                gamePackets.add(new ClientboundLevelChunkWithLightPacket(chunk, lightEngine, new java.util.BitSet(), new java.util.BitSet()));
             }
         }
 
@@ -325,6 +331,7 @@ public class Recorder {
         };
         for (Entity entity : level.getEntities().getAll()) {
             if (entity == this.serverPlayer) continue;
+            if (shouldIgnoreEntity(entity)) continue;
             int dx = entity.chunkPosition().x - centerPos.x;
             int dz = entity.chunkPosition().z - centerPos.z;
             if (Math.abs(dx) > viewDistance || Math.abs(dz) > viewDistance) continue;
@@ -359,7 +366,7 @@ public class Recorder {
                 showDeathScreen,
                 limitedCrafting,
                 commonSpawn,
-                server.enforceSecureProfile());
+                false);
     }
 
     private void writeCreateLocalPlayer() {
@@ -398,10 +405,16 @@ public class Recorder {
         List<EntityPos> changed = new ArrayList<>();
         for (Entity entity : level.getEntities().getAll()) {
             if (entity == this.serverPlayer) continue;
-            changed.add(new EntityPos(entity.getId(),
-                    entity.getX(), entity.getY(), entity.getZ(),
+            if (shouldIgnoreEntity(entity)) continue;
+            net.minecraft.world.phys.Vec3 pos = entity.trackingPosition();
+            EntityPos current = new EntityPos(entity.getId(),
+                    pos.x, pos.y, pos.z,
                     entity.getYRot(), entity.getXRot(), entity.getYHeadRot(),
-                    entity.onGround()));
+                    entity.onGround());
+            EntityPos last = this.lastPositions.get(entity);
+            if (current.equals(last)) continue;
+            this.lastPositions.put(entity, current);
+            changed.add(current);
         }
         if (changed.isEmpty()) return;
         ResourceKey<Level> dim = level.dimension();
@@ -427,4 +440,11 @@ public class Recorder {
 
     private record EntityPos(int id, double x, double y, double z,
                              float yaw, float pitch, float headYRot, boolean onGround) {}
+
+    private static boolean shouldIgnoreEntity(Entity entity) {
+        return entity == null
+                || entity.isRemoved()
+                || entity instanceof net.minecraft.world.entity.boss.EnderDragonPart
+                || entity.getType().clientTrackingRange() <= 0;
+    }
 }

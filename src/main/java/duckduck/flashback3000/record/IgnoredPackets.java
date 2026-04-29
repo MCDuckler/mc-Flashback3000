@@ -2,20 +2,28 @@ package duckduck.flashback3000.record;
 
 import net.minecraft.network.protocol.BundleDelimiterPacket;
 import net.minecraft.network.protocol.Packet;
+import net.minecraft.network.protocol.common.ClientboundClearDialogPacket;
 import net.minecraft.network.protocol.common.ClientboundCustomReportDetailsPacket;
 import net.minecraft.network.protocol.common.ClientboundDisconnectPacket;
 import net.minecraft.network.protocol.common.ClientboundKeepAlivePacket;
 import net.minecraft.network.protocol.common.ClientboundPingPacket;
 import net.minecraft.network.protocol.common.ClientboundServerLinksPacket;
+import net.minecraft.network.protocol.common.ClientboundShowDialogPacket;
 import net.minecraft.network.protocol.common.ClientboundStoreCookiePacket;
 import net.minecraft.network.protocol.common.ClientboundTransferPacket;
+import net.minecraft.network.protocol.configuration.ClientboundCodeOfConductPacket;
 import net.minecraft.network.protocol.configuration.ClientboundFinishConfigurationPacket;
+import net.minecraft.network.protocol.configuration.ClientboundResetChatPacket;
 import net.minecraft.network.protocol.cookie.ClientboundCookieRequestPacket;
 import net.minecraft.network.protocol.game.ClientboundAwardStatsPacket;
 import net.minecraft.network.protocol.game.ClientboundBlockChangedAckPacket;
 import net.minecraft.network.protocol.game.ClientboundChunkBatchFinishedPacket;
 import net.minecraft.network.protocol.game.ClientboundChunkBatchStartPacket;
 import net.minecraft.network.protocol.game.ClientboundCommandSuggestionsPacket;
+import net.minecraft.network.protocol.game.ClientboundDebugBlockValuePacket;
+import net.minecraft.network.protocol.game.ClientboundDebugChunkValuePacket;
+import net.minecraft.network.protocol.game.ClientboundDebugEntityValuePacket;
+import net.minecraft.network.protocol.game.ClientboundDebugEventPacket;
 import net.minecraft.network.protocol.game.ClientboundCommandsPacket;
 import net.minecraft.network.protocol.game.ClientboundContainerClosePacket;
 import net.minecraft.network.protocol.game.ClientboundContainerSetContentPacket;
@@ -60,6 +68,8 @@ import net.minecraft.network.protocol.game.ClientboundTagQueryPacket;
 import net.minecraft.network.protocol.game.ClientboundTickingStatePacket;
 import net.minecraft.network.protocol.game.ClientboundTickingStepPacket;
 import net.minecraft.network.protocol.game.ClientboundUpdateAdvancementsPacket;
+import net.minecraft.network.protocol.game.ClientboundTestInstanceBlockStatus;
+import net.minecraft.network.protocol.game.ClientboundTrackedWaypointPacket;
 import net.minecraft.network.protocol.game.ClientboundUpdateRecipesPacket;
 import net.minecraft.network.protocol.ping.ClientboundPongResponsePacket;
 
@@ -97,9 +107,13 @@ public final class IgnoredPackets {
             ClientboundPingPacket.class,
             ClientboundKeepAlivePacket.class,
             ClientboundTransferPacket.class,
+            ClientboundClearDialogPacket.class,
+            ClientboundShowDialogPacket.class,
 
-            // Configuration phase tail
+            // Configuration phase tail / chat
             ClientboundFinishConfigurationPacket.class,
+            ClientboundCodeOfConductPacket.class,
+            ClientboundResetChatPacket.class,
 
             // Chat lifecycle (Flashback converts player chat to system chat itself)
             ClientboundPlayerChatPacket.class,
@@ -147,6 +161,12 @@ public final class IgnoredPackets {
             ClientboundChunkBatchStartPacket.class,
             ClientboundChunkBatchFinishedPacket.class,
             ClientboundDebugSamplePacket.class,
+            ClientboundDebugBlockValuePacket.class,
+            ClientboundDebugChunkValuePacket.class,
+            ClientboundDebugEntityValuePacket.class,
+            ClientboundDebugEventPacket.class,
+            ClientboundTestInstanceBlockStatus.class,
+            ClientboundTrackedWaypointPacket.class,
             ClientboundPongResponsePacket.class
     );
 }
