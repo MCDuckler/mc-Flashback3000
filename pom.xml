@@ -137,4 +137,15 @@
             <scope>provided</scope>
         </dependency>
     </dependencies>
+
+    <distributionManagement>
+        <repository>
+            <id>hv-maven</id>
+            <url>https://mgr.havoc.games/nexus/repository/hv-maven/</url>
+        </repository>
+        <snapshotRepository>
+            <id>hv-maven</id>
+            <url>https://mgr.havoc.games/nexus/repository/hv-maven/</url>
+        </snapshotRepository>
+    </distributionManagement>
 </project>
