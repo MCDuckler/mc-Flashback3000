@@ -156,6 +156,7 @@ public class Recorder {
 
     public void acceptOutboundPacket(Packet<?> packet) {
         if (this.stopped) return;
+        if (IgnoredPackets.isIgnored(packet)) return;
         if (packet instanceof ClientboundCustomPayloadPacket cp) {
             String ns = cp.payload().type().id().getNamespace();
             if (duckduck.flashback3000.protocol.PacketIds.CHANNEL_NAMESPACE.equals(ns)) return;
