@@ -193,10 +193,6 @@ public class AsyncReplaySaver {
             } catch (IOException e) {
                 throw new RuntimeException(e);
             }
-            // chunk cache file indices restart per replay-chunk so the dedup map should too —
-            // otherwise it grows for the lifetime of the recording.
-            this.cachedChunkPackets.clear();
-            this.totalWrittenChunkPackets = 0;
         });
     }
 
