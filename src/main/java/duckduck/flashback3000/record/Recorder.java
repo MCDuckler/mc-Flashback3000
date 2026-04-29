@@ -99,6 +99,14 @@ public class Recorder {
     private final AtomicReference<Throwable> capturedError = new AtomicReference<>();
     private final java.util.WeakHashMap<Entity, EntityPos> lastPositions = new java.util.WeakHashMap<>();
 
+    /**
+     * When non-null, captured outbound packets land here instead of pendingPackets.
+     * Used to capture the post-ModelEngine packet stream emitted by forced
+     * tracker re-pair during snapshot construction.
+     */
+    private volatile java.util.List<Packet<?>> snapshotCaptureBuffer = null;
+    private volatile Channel channel = null;
+
     private int writtenTicksInChunk = 0;
     private int writtenTicks = 0;
     private boolean needsInitialSnapshot = true;
@@ -138,6 +146,7 @@ public class Recorder {
     public void start(Flashback3000 plugin) {
         ServerCommonPacketListenerImpl listener = this.serverPlayer.connection;
         Channel channel = listener.connection.channel;
+        this.channel = channel;
         this.captureHandler = new PacketCaptureHandler(this);
         channel.eventLoop().execute(() -> {
             try {
@@ -168,6 +177,14 @@ public class Recorder {
         int selfId = this.serverPlayer.getId();
         if (packet instanceof ClientboundSetEntityDataPacket data && data.id() == selfId) return;
         if (packet instanceof ClientboundSetEquipmentPacket equip && equip.getEntity() == selfId) return;
+        java.util.List<Packet<?>> snap = this.snapshotCaptureBuffer;
+        if (snap != null) {
+            // During a snapshot re-pair pass we drop RemoveEntities (we trigger the removal
+            // ourselves to force a re-track and don't want it baked into the snapshot).
+            if (packet instanceof net.minecraft.network.protocol.game.ClientboundRemoveEntitiesPacket) return;
+            snap.add(packet);
+            return;
+        }
         this.pendingPackets.add(packet);
     }
 
@@ -313,6 +330,18 @@ public class Recorder {
         int viewDistance = Math.max(2, this.serverPlayer.requestedViewDistance());
         ChunkPos centerPos = this.serverPlayer.chunkPosition();
         LevelLightEngine lightEngine = level.getChunkSource().getLightEngine();
+
+        // Force the light engine to flush all pending updates BEFORE constructing chunk packets,
+        // otherwise the resulting LightUpdatePacketData captures stale / empty section masks
+        // and chunks render fully dark on playback regardless of in-game time of day.
+        try {
+            for (int i = 0; i < 256; i++) {
+                if (lightEngine.runLightUpdates() == 0) break;
+            }
+        } catch (Throwable t) {
+            Flashback3000.getInstance().getLogger().fine("Light update pump failed: " + t);
+        }
+
         Set<Long> seen = new HashSet<>();
         for (int dx = -viewDistance; dx <= viewDistance; dx++) {
             for (int dz = -viewDistance; dz <= viewDistance; dz++) {
@@ -325,21 +354,30 @@ public class Recorder {
             }
         }
 
+        // Split entities: vanilla ones use sendPairingData (cheap, no flicker), ModelEngine-related
+        // ones must be re-paired through the netty pipeline so ModelEngine's handler injects the
+        // pivot AddEntity / SetPassengers tree (otherwise the model parts attach to a nonexistent
+        // pivot client-side and stay frozen while the base mob moves).
         net.minecraft.server.level.ServerEntity.Synchronizer noopSync = new net.minecraft.server.level.ServerEntity.Synchronizer() {
             @Override public void sendToTrackingPlayers(Packet<? super ClientGamePacketListener> p) {}
             @Override public void sendToTrackingPlayersAndSelf(Packet<? super ClientGamePacketListener> p) {}
             @Override public void sendToTrackingPlayersFiltered(Packet<? super ClientGamePacketListener> p, java.util.function.Predicate<net.minecraft.server.level.ServerPlayer> filter) {}
         };
+
+        net.minecraft.server.level.ChunkMap chunkMap = level.getChunkSource().chunkMap;
+        java.util.List<net.minecraft.server.level.ChunkMap.TrackedEntity> meEntities = new ArrayList<>();
+
         for (Entity entity : level.getEntities().getAll()) {
             if (entity == this.serverPlayer) continue;
             if (shouldIgnoreEntity(entity)) continue;
-            // ModelEngine fully suppresses packets for entities whose base mob is hidden,
-            // so we drop them from the snapshot too — otherwise the recording shows the
-            // raw cow/zombie underneath the model.
             if (ModelEngineCompat.shouldHideBase(entity)) continue;
-            // Display entities (Item/Block/Text) carry custom models and use a per-instance
-            // view range that the static EntityType.clientTrackingRange doesn't reflect.
-            // Always include them so ModelEngine model parts aren't culled out of snapshots.
+
+            if (ModelEngineCompat.isMERelated(entity)) {
+                net.minecraft.server.level.ChunkMap.TrackedEntity te = chunkMap.entityMap.get(entity.getId());
+                if (te != null) meEntities.add(te);
+                continue;
+            }
+
             if (!(entity instanceof net.minecraft.world.entity.Display)) {
                 int dx = entity.chunkPosition().x - centerPos.x;
                 int dz = entity.chunkPosition().z - centerPos.z;
@@ -352,6 +390,36 @@ public class Recorder {
                 se.sendPairingData(this.serverPlayer, gamePackets::add);
             } catch (Throwable t) {
                 Flashback3000.getInstance().getLogger().fine("Skipping entity " + entity.getId() + " in snapshot: " + t);
+            }
+        }
+
+        // Re-pair ME-related entities through the real channel pipeline so ModelEngine's
+        // handler runs and injects the pivot/passengers tree we'd otherwise miss. The
+        // captureHandler buffers the resulting packets into snapshotCaptureBuffer.
+        if (!meEntities.isEmpty() && this.channel != null) {
+            java.util.List<Packet<?>> captured = java.util.Collections.synchronizedList(new ArrayList<>());
+            this.snapshotCaptureBuffer = captured;
+            try {
+                for (net.minecraft.server.level.ChunkMap.TrackedEntity te : meEntities) {
+                    try { te.removePlayer(this.serverPlayer); } catch (Throwable ignored) {}
+                }
+                for (net.minecraft.server.level.ChunkMap.TrackedEntity te : meEntities) {
+                    try { te.updatePlayer(this.serverPlayer); } catch (Throwable ignored) {}
+                }
+                // Drain the netty event loop so all queued writes have flowed through the
+                // pipeline and our captureHandler before we close out the snapshot.
+                try {
+                    this.channel.eventLoop().submit(() -> {}).get(2, java.util.concurrent.TimeUnit.SECONDS);
+                } catch (Throwable t) {
+                    Flashback3000.getInstance().getLogger().fine("Snapshot drain timed out: " + t);
+                }
+            } finally {
+                this.snapshotCaptureBuffer = null;
+            }
+            for (Packet<?> p : captured) {
+                @SuppressWarnings("unchecked")
+                Packet<? super ClientGamePacketListener> casted = (Packet<? super ClientGamePacketListener>) p;
+                gamePackets.add(casted);
             }
         }
 
