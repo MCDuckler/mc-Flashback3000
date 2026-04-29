@@ -96,6 +96,19 @@ public class Recorder {
     private @Nullable BukkitTask tickTask;
 
     private final ConcurrentLinkedQueue<Packet<?>> pendingPackets = new ConcurrentLinkedQueue<>();
+    /**
+     * SetPassengers and SetEntityLink need to be written one recording tick AFTER the
+     * AddEntity for their target. Flashback's playback uses level.getEntity() (not the
+     * pending-entities map) for these, and pendingEntities only flushes on handleNextTick.
+     * Same-tick AddEntity + SetPassengers → playback drops the passenger attachment and
+     * model-engine displays sit frozen at their spawn position.
+     *
+     * Captured "this tick" go into pendingDeferredThisTick. tick() drains the previous
+     * tick's deferred queue and swaps it with this tick's, so writes always lag the
+     * AddEntity that may have created the referenced ids.
+     */
+    private final ConcurrentLinkedQueue<Packet<?>> pendingDeferredThisTick = new ConcurrentLinkedQueue<>();
+    private final ConcurrentLinkedQueue<Packet<?>> deferredFromLastTick = new ConcurrentLinkedQueue<>();
     private final AtomicReference<Throwable> capturedError = new AtomicReference<>();
     private final java.util.WeakHashMap<Entity, EntityPos> lastPositions = new java.util.WeakHashMap<>();
 
@@ -200,12 +213,25 @@ public class Recorder {
         int selfId = this.serverPlayer.getId();
         if (packet instanceof ClientboundSetEntityDataPacket data && data.id() == selfId) return;
         if (packet instanceof ClientboundSetEquipmentPacket equip && equip.getEntity() == selfId) return;
+        boolean orderSensitive = packet instanceof net.minecraft.network.protocol.game.ClientboundSetPassengersPacket
+                || packet instanceof net.minecraft.network.protocol.game.ClientboundSetEntityLinkPacket;
         java.util.List<Packet<?>> snap = this.snapshotCaptureBuffer;
         if (snap != null) {
             // During a snapshot re-pair pass we drop RemoveEntities (we trigger the removal
             // ourselves to force a re-track and don't want it baked into the snapshot).
             if (packet instanceof net.minecraft.network.protocol.game.ClientboundRemoveEntitiesPacket) return;
+            // Snapshots can't have NextTick markers, so order-sensitive packets must be
+            // written AFTER the snapshot ends. Stash them — finalizeSnapshot will hand them
+            // off to the post-snapshot deferral queue.
+            if (orderSensitive) {
+                this.pendingDeferredThisTick.add(packet);
+                return;
+            }
             snap.add(packet);
+            return;
+        }
+        if (orderSensitive) {
+            this.pendingDeferredThisTick.add(packet);
             return;
         }
         this.pendingPackets.add(packet);
@@ -239,7 +265,16 @@ public class Recorder {
                     }
                 }
                 case COMPLETE -> {
+                    // Drain previous tick's deferred queue first — these reference entities
+                    // whose AddEntity has already been flushed by playback's handleNextTick.
+                    this.flushDeferredFromLastTick();
                     this.flushPendingPackets();
+                    // Move this tick's deferred captures into "last tick's" slot for the
+                    // next tick to flush.
+                    Packet<?> p;
+                    while ((p = this.pendingDeferredThisTick.poll()) != null) {
+                        this.deferredFromLastTick.add(p);
+                    }
                     this.writeEntityPositions();
                     this.asyncReplaySaver.submit(w -> w.startAndFinishAction(ActionNextTick.INSTANCE));
                     this.writtenTicksInChunk++;
@@ -260,6 +295,18 @@ public class Recorder {
         List<Packet<? super ClientGamePacketListener>> gamePackets = new ArrayList<>();
         Packet<?> p;
         while ((p = this.pendingPackets.poll()) != null) {
+            @SuppressWarnings("unchecked")
+            Packet<? super ClientGamePacketListener> casted = (Packet<? super ClientGamePacketListener>) p;
+            gamePackets.add(casted);
+        }
+        this.asyncReplaySaver.writeGamePackets(this.gamePacketCodec, gamePackets);
+    }
+
+    private void flushDeferredFromLastTick() {
+        if (this.deferredFromLastTick.isEmpty()) return;
+        List<Packet<? super ClientGamePacketListener>> gamePackets = new ArrayList<>();
+        Packet<?> p;
+        while ((p = this.deferredFromLastTick.poll()) != null) {
             @SuppressWarnings("unchecked")
             Packet<? super ClientGamePacketListener> casted = (Packet<? super ClientGamePacketListener>) p;
             gamePackets.add(casted);
