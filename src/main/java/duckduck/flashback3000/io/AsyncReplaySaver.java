@@ -31,7 +31,7 @@ import java.util.function.Consumer;
 
 public class AsyncReplaySaver {
 
-    public static final int CHUNK_CACHE_SIZE = 32;
+    public static final int CHUNK_CACHE_SIZE = 10000;
 
     private final ArrayBlockingQueue<Consumer<ReplayWriter>> tasks = new ArrayBlockingQueue<>(1024);
     private final AtomicReference<Throwable> error = new AtomicReference<>(null);
