@@ -99,35 +99,23 @@ public class Recorder {
     private final AtomicReference<Throwable> capturedError = new AtomicReference<>();
     private final java.util.WeakHashMap<Entity, EntityPos> lastPositions = new java.util.WeakHashMap<>();
 
-    /**
-     * When non-null, captured outbound packets land here instead of pendingPackets.
-     * Used to capture the post-ModelEngine packet stream emitted by forced
-     * tracker re-pair during snapshot construction.
-     */
-    private volatile java.util.List<Packet<?>> snapshotCaptureBuffer = null;
     private volatile Channel channel = null;
 
     private int writtenTicksInChunk = 0;
     private int writtenTicks = 0;
     private volatile boolean stopped = false;
 
-    private enum SnapshotPhase { NEEDED, DRAINING, COMPLETE }
-    private SnapshotPhase snapshotPhase = SnapshotPhase.NEEDED;
-    private int snapshotDrainTicks = 0;
     /**
-     * Total ticks to leave snapshotCaptureBuffer armed. ME's pivot/passenger spawn requires
-     * a transition (untracked → tracked) detected by its syncUpdate, then asyncUpdate moves
-     * the player into startTracking, then an async render cycle emits the bundle. We split
-     * the re-pair across ticks: removePlayer at tick 0, updatePlayer at ME_RE_ADD_TICK, then
-     * keep capturing for SNAPSHOT_DRAIN_TICKS while ME's executor pool drains its render
-     * queue. ModelUpdaters.tick chains via lastTickFuture, so a render backlog (hundreds of
-     * entities) can serialize over many ticks. 60 ticks (3s) is enough headroom for CTA-scale
-     * worlds; before finalizing we also wait on a netty event-loop marker to drain in-flight
-     * packets to our captureHandler.
+     * False until the snapshot for the current chunk has been written. Snapshot is built
+     * synchronously from server state — including ME models constructed via
+     * {@link duckduck.flashback3000.compat.ModelEngineCompat#buildSpawnPackets} — so it
+     * completes within a single tick and we don't need a drain phase.
      */
-    private static final int ME_RE_ADD_TICK = 5;
-    private static final int SNAPSHOT_DRAIN_TICKS = 60;
-    private java.util.List<net.minecraft.server.level.ChunkMap.TrackedEntity> meEntitiesPendingReAdd = null;
+    private boolean snapshotWritten = false;
+
+    // Diagnostic counters for snapshot vs main-stream packet emission. Logged on stop().
+    private int snapMeBundlePackets = 0;
+    private int snapMeBundleEntities = 0;
 
     public Recorder(org.bukkit.entity.Player bukkitPlayer, Path recordFolder, String name) {
         this.bukkitPlayer = bukkitPlayer;
@@ -183,7 +171,6 @@ public class Recorder {
 
     public void acceptOutboundPacket(Packet<?> packet) {
         if (this.stopped) return;
-        // Diagnostic: trace position-sync / teleport / set-passengers packets to verify ME emissions reach us
         if (Flashback3000.DEBUG_TRACE_PACKETS) {
             String n = packet.getClass().getSimpleName();
             if (n.equals("ClientboundEntityPositionSyncPacket")
@@ -204,55 +191,26 @@ public class Recorder {
         int selfId = this.serverPlayer.getId();
         if (packet instanceof ClientboundSetEntityDataPacket data && data.id() == selfId) return;
         if (packet instanceof ClientboundSetEquipmentPacket equip && equip.getEntity() == selfId) return;
-        java.util.List<Packet<?>> snap = this.snapshotCaptureBuffer;
-        if (snap != null) {
-            // During a snapshot re-pair pass we drop RemoveEntities (we trigger the removal
-            // ourselves to force a re-track and don't want it baked into the snapshot).
-            if (packet instanceof net.minecraft.network.protocol.game.ClientboundRemoveEntitiesPacket) return;
-            snap.add(packet);
-            return;
-        }
         this.pendingPackets.add(packet);
     }
 
     public void tick() {
         if (this.stopped) return;
         try {
-            switch (this.snapshotPhase) {
-                case NEEDED -> {
-                    this.beginSnapshot();
-                    this.snapshotPhase = SnapshotPhase.DRAINING;
-                    this.snapshotDrainTicks = 0;
-                }
-                case DRAINING -> {
-                    this.snapshotDrainTicks++;
-                    if (this.snapshotDrainTicks == ME_RE_ADD_TICK && this.meEntitiesPendingReAdd != null) {
-                        // ModelEngine has had a tick to observe the un-pair and queue
-                        // stopTracking. Re-pair now so the transition flips back and ME's
-                        // next render cycle emits the pivot/passengers spawn bundle.
-                        for (net.minecraft.server.level.ChunkMap.TrackedEntity te : this.meEntitiesPendingReAdd) {
-                            try { te.updatePlayer(this.serverPlayer); } catch (Throwable t) {
-                                Flashback3000.getInstance().getLogger().warning("updatePlayer failed: " + t);
-                            }
-                        }
-                        this.meEntitiesPendingReAdd = null;
-                    }
-                    if (this.snapshotDrainTicks >= SNAPSHOT_DRAIN_TICKS) {
-                        this.finalizeSnapshot();
-                        this.snapshotPhase = SnapshotPhase.COMPLETE;
-                    }
-                }
-                case COMPLETE -> {
-                    this.flushPendingPackets();
-                    this.writeEntityPositions();
-                    this.asyncReplaySaver.submit(w -> w.startAndFinishAction(ActionNextTick.INSTANCE));
-                    this.writtenTicksInChunk++;
-                    this.writtenTicks++;
+            if (!this.snapshotWritten) {
+                this.writeSnapshot();
+                this.snapshotWritten = true;
+                // Real-time packets emitted during this tick (post-snapshot construction)
+                // belong in the main stream — flush them now so they land in tick 0.
+            }
+            this.flushPendingPackets();
+            this.writeEntityPositions();
+            this.asyncReplaySaver.submit(w -> w.startAndFinishAction(ActionNextTick.INSTANCE));
+            this.writtenTicksInChunk++;
+            this.writtenTicks++;
 
-                    if (this.writtenTicksInChunk >= CHUNK_LENGTH_TICKS) {
-                        this.flushChunk(false);
-                    }
-                }
+            if (this.writtenTicksInChunk >= CHUNK_LENGTH_TICKS) {
+                this.flushChunk(false);
             }
         } catch (Throwable t) {
             this.onError(t);
@@ -282,9 +240,8 @@ public class Recorder {
         this.asyncReplaySaver.writeReplayChunk(chunkName, json);
         this.writtenTicksInChunk = 0;
         if (!closing) {
-            // Restart the snapshot phase machine. The next tick will rebuild the snapshot
-            // for the new replay-chunk file.
-            this.snapshotPhase = SnapshotPhase.NEEDED;
+            // Next tick will rebuild a fresh snapshot for the new replay-chunk file.
+            this.snapshotWritten = false;
         }
     }
 
@@ -308,15 +265,12 @@ public class Recorder {
         } catch (Throwable ignored) {}
 
         try {
-            // If we're stopping mid-snapshot (NEEDED never fired or DRAINING in progress),
-            // close out the snapshot so the chunk file isn't left with an open snapshot block.
-            if (this.snapshotPhase == SnapshotPhase.NEEDED) {
-                this.beginSnapshot();
-                this.finalizeSnapshot();
-            } else if (this.snapshotPhase == SnapshotPhase.DRAINING) {
-                this.finalizeSnapshot();
+            // If stop fires before the first tick, the snapshot for this chunk hasn't been
+            // written yet — write it now so the chunk file isn't left with an open header.
+            if (!this.snapshotWritten) {
+                this.writeSnapshot();
+                this.snapshotWritten = true;
             }
-            this.snapshotPhase = SnapshotPhase.COMPLETE;
             this.flushPendingPackets();
             if (this.writtenTicksInChunk == 0) {
                 this.asyncReplaySaver.submit(w -> w.startAndFinishAction(ActionNextTick.INSTANCE));
@@ -327,52 +281,35 @@ public class Recorder {
         } catch (Throwable t) {
             this.onError(t);
         }
+        Flashback3000.getInstance().getLogger().info("F3K stop: snapshot ME packets=" + snapMeBundlePackets
+                + " across " + snapMeBundleEntities + " entities");
         return this.asyncReplaySaver.finish();
     }
 
     // -------- snapshot generation --------
 
-    private void beginSnapshot() {
+    /**
+     * Build and emit the entire snapshot for the current chunk in one synchronous pass.
+     * For ME-modeled entities we directly construct the spawn bundle (pivot AddEntity,
+     * bone AddEntity+SetEntityData, pivotMount SetPassengers, hitbox/shadow) by reading
+     * ME's renderer state via {@link duckduck.flashback3000.compat.ModelEngineCompat#buildSpawnPackets}.
+     *
+     * <p>Replaces the prior tracker-re-pair flow: that flow called
+     * {@code te.removePlayer / te.updatePlayer} hoping ME's syncUpdate would observe a
+     * tracking transition and ME's async render queue would emit the spawn bundle into
+     * the captured packet buffer within a 60-tick drain window. In practice ME's render
+     * queue can lag arbitrarily long behind real time on a busy server, so the bundle
+     * arrived after the buffer closed and went to the main stream — leaving the snapshot
+     * with no pivotMount and the model parts visually frozen during playback.
+     */
+    private void writeSnapshot() {
         this.asyncReplaySaver.submit(ReplayWriter::startSnapshot);
         try {
             this.writeConfigurationSnapshot();
             this.writeGameSnapshot();
         } catch (Throwable t) {
-            Flashback3000.getInstance().getLogger().severe("Snapshot begin failed: " + t);
+            Flashback3000.getInstance().getLogger().severe("Snapshot write failed: " + t);
             this.onError(t);
-        }
-        // snapshotCaptureBuffer is left active by writeGameSnapshot if ME entities were
-        // re-paired. Real-time outbound packets to the player keep landing in it during
-        // the drain window — they all become part of the snapshot.
-    }
-
-    private void finalizeSnapshot() {
-        // Drain pending writes on the netty event loop before snapshotting captured packets:
-        // ME emits via pipeline.writeAndFlush from its executor pool, so a packet may already
-        // be queued on the event loop when this main-thread tick fires. Submitting a no-op
-        // task and awaiting it guarantees every prior write has reached our captureHandler.
-        Channel ch = this.channel;
-        if (ch != null && ch.eventLoop() != null) {
-            try {
-                ch.eventLoop().submit(() -> null).get(250, java.util.concurrent.TimeUnit.MILLISECONDS);
-            } catch (Throwable ignored) {}
-        }
-        java.util.List<Packet<?>> captured = this.snapshotCaptureBuffer;
-        this.snapshotCaptureBuffer = null;
-        if (captured != null && !captured.isEmpty()) {
-            List<Packet<? super ClientGamePacketListener>> meBatch = new ArrayList<>(captured.size());
-            synchronized (captured) {
-                for (Packet<?> p : captured) {
-                    @SuppressWarnings("unchecked")
-                    Packet<? super ClientGamePacketListener> casted = (Packet<? super ClientGamePacketListener>) p;
-                    meBatch.add(casted);
-                }
-            }
-            try {
-                this.asyncReplaySaver.writeGamePackets(this.gamePacketCodec, meBatch);
-            } catch (Throwable t) {
-                Flashback3000.getInstance().getLogger().severe("Snapshot ME batch submit failed: " + t);
-            }
         }
         this.asyncReplaySaver.submit(ReplayWriter::endSnapshot);
     }
@@ -449,42 +386,50 @@ public class Recorder {
             }
         }
 
-        // Split entities: vanilla ones use sendPairingData (cheap, no flicker), ModelEngine-related
-        // ones must be re-paired through the netty pipeline so ModelEngine's handler injects the
-        // pivot AddEntity / SetPassengers tree (otherwise the model parts attach to a nonexistent
-        // pivot client-side and stay frozen while the base mob moves).
+        // Vanilla entities use sendPairingData (cheap, deterministic). ModelEngine-modeled
+        // entities additionally get a directly-constructed spawn bundle that mirrors what
+        // DisplayParser.spawn would emit on a fresh tracker pairing. This avoids depending
+        // on ME's async render queue firing within a drain window — the prior flow lost
+        // pivot/bone AddEntity and pivotMount SetPassengers when ME was lagging.
         net.minecraft.server.level.ServerEntity.Synchronizer noopSync = new net.minecraft.server.level.ServerEntity.Synchronizer() {
             @Override public void sendToTrackingPlayers(Packet<? super ClientGamePacketListener> p) {}
             @Override public void sendToTrackingPlayersAndSelf(Packet<? super ClientGamePacketListener> p) {}
             @Override public void sendToTrackingPlayersFiltered(Packet<? super ClientGamePacketListener> p, java.util.function.Predicate<net.minecraft.server.level.ServerPlayer> filter) {}
         };
 
-        java.util.List<net.minecraft.server.level.ChunkMap.TrackedEntity> meEntities = new ArrayList<>();
-        net.minecraft.server.level.ChunkMap chunkMap = null;
-        try {
-            chunkMap = level.getChunkSource().chunkMap;
-        } catch (Throwable t) {
-            Flashback3000.getInstance().getLogger().warning("Could not access chunkMap: " + t);
-        }
-
+        int meBundlePackets = 0;
+        int meBundleEntities = 0;
         for (Entity entity : level.getEntities().getAll()) {
             try {
                 if (entity == this.serverPlayer) continue;
                 if (shouldIgnoreEntity(entity)) continue;
 
-                // ModelEngine-related entities (incl. hidden bases): re-pair via the netty
-                // pipeline so ME's syncUpdate detects the start-tracking transition and
-                // DisplayParser.spawn fires the pivot/displays/SetPassengers bundle.
-                // Hidden bases STILL need re-pair — that's the only way ME emits the bundle
-                // we care about. We just don't manually emit AddEntity for them.
                 boolean isModeled = ModelEngineCompat.isMERelated(entity);
                 boolean hiddenBase = ModelEngineCompat.shouldHideBase(entity);
-                if (isModeled || hiddenBase) {
-                    if (chunkMap != null) {
-                        net.minecraft.server.level.ChunkMap.TrackedEntity te = chunkMap.entityMap.get(entity.getId());
-                        if (te != null) meEntities.add(te);
+                boolean isMERelated = isModeled || hiddenBase;
+
+                if (isMERelated) {
+                    // Directly construct ME's spawn bundle (pivot, bones, pivotMount, hitbox).
+                    // Display entities reach this branch too (isMERelated returns true for any
+                    // Display), but only those owned by an actual ModeledEntity will produce
+                    // packets here — others get pairing data below.
+                    java.util.List<Packet<? super ClientGamePacketListener>> mePackets =
+                            ModelEngineCompat.buildSpawnPackets(entity);
+                    if (!mePackets.isEmpty()) {
+                        gamePackets.addAll(mePackets);
+                        meBundlePackets += mePackets.size();
+                        meBundleEntities++;
+                        // For hidden bases the base mob is invisible client-side; the model
+                        // bundle alone is enough. For VISIBLE bases the player still needs the
+                        // base AddEntity etc., so fall through to vanilla pairing below.
+                        if (hiddenBase) continue;
+                    } else if (entity instanceof net.minecraft.world.entity.Display) {
+                        // A standalone Display entity (not part of an ME model) — vanilla pairing.
+                    } else if (hiddenBase) {
+                        // ME thinks this is hidden but we couldn't build a bundle; skip emitting
+                        // the base since AddEntity would be filtered client-side anyway.
+                        continue;
                     }
-                    continue;
                 }
 
                 if (!(entity instanceof net.minecraft.world.entity.Display)) {
@@ -501,32 +446,15 @@ public class Recorder {
             }
         }
 
-        // Submit the bulk snapshot NOW. If the ME re-pair phase below fails or times out,
-        // at least the world + vanilla entities are already in the snapshot.
+        this.snapMeBundlePackets = meBundlePackets;
+        this.snapMeBundleEntities = meBundleEntities;
+        Flashback3000.getInstance().getLogger().info(
+                "F3K snapshot: built " + meBundlePackets + " ME packets across " + meBundleEntities + " entities");
+
         try {
             this.asyncReplaySaver.writeGamePackets(this.gamePacketCodec, gamePackets);
         } catch (Throwable t) {
             Flashback3000.getInstance().getLogger().severe("Failed to submit snapshot game packets: " + t);
-            return;
-        }
-
-        // Trigger ME-aware spawn flow: un-pair the tracker now, then RE-pair on a later tick
-        // (ME_RE_ADD_TICK in the DRAINING phase). The split is required because ModelEngine's
-        // BukkitEntityData.syncUpdate detects tracking transitions by diffing the previous
-        // tick's syncTracking set against the current NMS seenBy; if removePlayer and
-        // updatePlayer happen in the same tick, no transition is observed and DisplayParser
-        // never emits the pivot/passengers spawn bundle for our player. snapshotCaptureBuffer
-        // stays armed across the drain window so ME's bundle (emitted ~3 ticks after the
-        // re-pair) lands in the snapshot.
-        if (!meEntities.isEmpty() && this.channel != null) {
-            java.util.List<Packet<?>> captured = java.util.Collections.synchronizedList(new ArrayList<>());
-            this.snapshotCaptureBuffer = captured;
-            for (net.minecraft.server.level.ChunkMap.TrackedEntity te : meEntities) {
-                try { te.removePlayer(this.serverPlayer); } catch (Throwable t) {
-                    Flashback3000.getInstance().getLogger().warning("removePlayer failed: " + t);
-                }
-            }
-            this.meEntitiesPendingReAdd = meEntities;
         }
     }
 
