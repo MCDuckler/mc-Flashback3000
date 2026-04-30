@@ -10,9 +10,7 @@ import duckduck.flashback3000.action.ActionNextTick;
 import duckduck.flashback3000.compat.ModelEngineCompat;
 import duckduck.flashback3000.io.AsyncReplaySaver;
 import duckduck.flashback3000.io.ReplayWriter;
-import duckduck.flashback3000.netty.PacketCaptureHandler;
 import io.netty.buffer.ByteBuf;
-import io.netty.channel.Channel;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.Registry;
 import net.minecraft.core.RegistryAccess;
@@ -47,7 +45,6 @@ import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
-import net.minecraft.server.network.ServerCommonPacketListenerImpl;
 import net.minecraft.tags.TagNetworkSerialization;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
@@ -92,14 +89,13 @@ public class Recorder {
 
     private final FlashbackMeta metadata = new FlashbackMeta();
     private final Path recordFolder;
-    private PacketCaptureHandler captureHandler;
     private @Nullable BukkitTask tickTask;
 
     private final ConcurrentLinkedQueue<Packet<?>> pendingPackets = new ConcurrentLinkedQueue<>();
     private final AtomicReference<Throwable> capturedError = new AtomicReference<>();
     private final java.util.WeakHashMap<Entity, EntityPos> lastPositions = new java.util.WeakHashMap<>();
 
-    private volatile Channel channel = null;
+    private duckduck.flashback3000.cache.PerPlayerContext playerCtx;
 
     private int writtenTicksInChunk = 0;
     private int writtenTicks = 0;
@@ -107,15 +103,14 @@ public class Recorder {
 
     /**
      * False until the snapshot for the current chunk has been written. Snapshot is built
-     * synchronously from server state — including ME models constructed via
-     * {@link duckduck.flashback3000.compat.ModelEngineCompat#buildSpawnPackets} — so it
-     * completes within a single tick and we don't need a drain phase.
+     * synchronously by walking the player's persistent {@link duckduck.flashback3000.cache.EntityStateCache}
+     * (populated by the always-on {@link PacketCaptureHandler} from the moment the player joined),
+     * so it completes within a single tick and needs no drain phase.
      */
     private boolean snapshotWritten = false;
 
-    // Diagnostic counters for snapshot vs main-stream packet emission. Logged on stop().
-    private int snapMeBundlePackets = 0;
-    private int snapMeBundleEntities = 0;
+    // Diagnostic counters logged on stop().
+    private int snapEntityCount = 0;
 
     public Recorder(org.bukkit.entity.Player bukkitPlayer, Path recordFolder, String name) {
         this.bukkitPlayer = bukkitPlayer;
@@ -149,17 +144,16 @@ public class Recorder {
     }
 
     public void start(Flashback3000 plugin) {
-        ServerCommonPacketListenerImpl listener = this.serverPlayer.connection;
-        Channel channel = listener.connection.channel;
-        this.channel = channel;
-        this.captureHandler = new PacketCaptureHandler(this);
-        channel.eventLoop().execute(() -> {
-            try {
-                channel.pipeline().addBefore("unbundler", PacketCaptureHandler.NAME, this.captureHandler);
-            } catch (Throwable t) {
-                this.onError(t);
-            }
-        });
+        // Hook into the player's persistent context (cache + handler installed at player-join).
+        // Setting activeRecorder turns the always-on capture handler into a forwarder for our
+        // main-stream pendingPackets; the cache keeps updating in the background regardless.
+        this.playerCtx = plugin.getPacketCacheManager().get(this.bukkitPlayer.getUniqueId());
+        if (this.playerCtx == null) {
+            // Player joined before plugin enable and never re-attached — fail loudly.
+            throw new IllegalStateException("No PerPlayerContext for " + this.bukkitPlayer.getName()
+                    + "; PacketCacheManager.attachAlreadyOnline must run on plugin enable.");
+        }
+        this.playerCtx.activeRecorder = this;
 
         this.tickTask = Bukkit.getScheduler().runTaskTimer(plugin, this::tick, 1L, 1L);
     }
@@ -252,17 +246,12 @@ public class Recorder {
             this.tickTask.cancel();
             this.tickTask = null;
         }
-        try {
-            ServerCommonPacketListenerImpl listener = this.serverPlayer.connection;
-            Channel channel = listener.connection.channel;
-            channel.eventLoop().execute(() -> {
-                try {
-                    if (channel.pipeline().get(PacketCaptureHandler.NAME) != null) {
-                        channel.pipeline().remove(PacketCaptureHandler.NAME);
-                    }
-                } catch (Throwable ignored) {}
-            });
-        } catch (Throwable ignored) {}
+
+        // Detach this recorder from the player context. The cache + handler stay attached for
+        // the player's lifetime so subsequent recordings don't lose accumulated state.
+        if (this.playerCtx != null && this.playerCtx.activeRecorder == this) {
+            this.playerCtx.activeRecorder = null;
+        }
 
         try {
             // If stop fires before the first tick, the snapshot for this chunk hasn't been
@@ -281,8 +270,8 @@ public class Recorder {
         } catch (Throwable t) {
             this.onError(t);
         }
-        Flashback3000.getInstance().getLogger().info("F3K stop: snapshot ME packets=" + snapMeBundlePackets
-                + " across " + snapMeBundleEntities + " entities");
+        Flashback3000.getInstance().getLogger().info(
+                "F3K stop: snapshot covered " + snapEntityCount + " cached entities");
         return this.asyncReplaySaver.finish();
     }
 
@@ -386,70 +375,19 @@ public class Recorder {
             }
         }
 
-        // Vanilla entities use sendPairingData (cheap, deterministic). ModelEngine-modeled
-        // entities additionally get a directly-constructed spawn bundle that mirrors what
-        // DisplayParser.spawn would emit on a fresh tracker pairing. This avoids depending
-        // on ME's async render queue firing within a drain window — the prior flow lost
-        // pivot/bone AddEntity and pivotMount SetPassengers when ME was lagging.
-        net.minecraft.server.level.ServerEntity.Synchronizer noopSync = new net.minecraft.server.level.ServerEntity.Synchronizer() {
-            @Override public void sendToTrackingPlayers(Packet<? super ClientGamePacketListener> p) {}
-            @Override public void sendToTrackingPlayersAndSelf(Packet<? super ClientGamePacketListener> p) {}
-            @Override public void sendToTrackingPlayersFiltered(Packet<? super ClientGamePacketListener> p, java.util.function.Predicate<net.minecraft.server.level.ServerPlayer> filter) {}
-        };
-
-        int meBundlePackets = 0;
-        int meBundleEntities = 0;
-        for (Entity entity : level.getEntities().getAll()) {
-            try {
-                if (entity == this.serverPlayer) continue;
-                if (shouldIgnoreEntity(entity)) continue;
-
-                boolean isModeled = ModelEngineCompat.isMERelated(entity);
-                boolean hiddenBase = ModelEngineCompat.shouldHideBase(entity);
-                boolean isMERelated = isModeled || hiddenBase;
-
-                if (isMERelated) {
-                    // Directly construct ME's spawn bundle (pivot, bones, pivotMount, hitbox).
-                    // Display entities reach this branch too (isMERelated returns true for any
-                    // Display), but only those owned by an actual ModeledEntity will produce
-                    // packets here — others get pairing data below.
-                    java.util.List<Packet<? super ClientGamePacketListener>> mePackets =
-                            ModelEngineCompat.buildSpawnPackets(entity);
-                    if (!mePackets.isEmpty()) {
-                        gamePackets.addAll(mePackets);
-                        meBundlePackets += mePackets.size();
-                        meBundleEntities++;
-                        // For hidden bases the base mob is invisible client-side; the model
-                        // bundle alone is enough. For VISIBLE bases the player still needs the
-                        // base AddEntity etc., so fall through to vanilla pairing below.
-                        if (hiddenBase) continue;
-                    } else if (entity instanceof net.minecraft.world.entity.Display) {
-                        // A standalone Display entity (not part of an ME model) — vanilla pairing.
-                    } else if (hiddenBase) {
-                        // ME thinks this is hidden but we couldn't build a bundle; skip emitting
-                        // the base since AddEntity would be filtered client-side anyway.
-                        continue;
-                    }
-                }
-
-                if (!(entity instanceof net.minecraft.world.entity.Display)) {
-                    int dx = entity.chunkPosition().x - centerPos.x;
-                    int dz = entity.chunkPosition().z - centerPos.z;
-                    int range = Math.max(viewDistance, entity.getType().clientTrackingRange());
-                    if (Math.abs(dx) > range || Math.abs(dz) > range) continue;
-                }
-                net.minecraft.server.level.ServerEntity se = new net.minecraft.server.level.ServerEntity(
-                        level, entity, 0, false, noopSync, java.util.Set.of());
-                se.sendPairingData(this.serverPlayer, gamePackets::add);
-            } catch (Throwable t) {
-                Flashback3000.getInstance().getLogger().warning("Skipping entity " + entity.getId() + " in snapshot: " + t);
-            }
+        // Entity snapshot: walk the always-on EntityStateCache and emit AddEntity / SetEntityData
+        // / SetPassengers / attrs / equipment per cached entity, using each entity's latest
+        // observed state. The cache has been accumulating since the player joined, so it covers
+        // every entity any plugin (ME, UltraCars, CTA cosmetics, ProtocolLib adapters, ...) ever
+        // sent the client an AddEntity for — no plugin-specific compatibility code required.
+        if (this.playerCtx != null) {
+            int beforeSize = gamePackets.size();
+            this.playerCtx.cache.writeSnapshot(this.serverPlayer.getId(), gamePackets::add);
+            this.snapEntityCount = this.playerCtx.cache.size();
+            Flashback3000.getInstance().getLogger().info(
+                    "F3K snapshot: emitted " + (gamePackets.size() - beforeSize)
+                            + " entity packets covering " + this.snapEntityCount + " cached entities");
         }
-
-        this.snapMeBundlePackets = meBundlePackets;
-        this.snapMeBundleEntities = meBundleEntities;
-        Flashback3000.getInstance().getLogger().info(
-                "F3K snapshot: built " + meBundlePackets + " ME packets across " + meBundleEntities + " entities");
 
         try {
             this.asyncReplaySaver.writeGamePackets(this.gamePacketCodec, gamePackets);

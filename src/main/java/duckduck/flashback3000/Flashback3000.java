@@ -1,6 +1,7 @@
 package duckduck.flashback3000;
 
 import duckduck.flashback3000.action.ActionRegistry;
+import duckduck.flashback3000.cache.PacketCacheManager;
 import duckduck.flashback3000.command.FlashbackCommand;
 import duckduck.flashback3000.playback.PlaybackManager;
 import duckduck.flashback3000.protocol.ServerProtocol;
@@ -30,10 +31,18 @@ public final class Flashback3000 extends JavaPlugin implements Listener {
     @Getter
     private PlaybackManager playbackManager;
 
+    @Getter
+    private PacketCacheManager packetCacheManager;
+
     @Override
     public void onEnable() {
         instance = this;
         ActionRegistry.bootstrap();
+
+        // Register the cache manager FIRST so its PlayerJoinEvent listener catches every join.
+        // attachAlreadyOnline() handles the corner case of /reload where players are already in.
+        this.packetCacheManager = new PacketCacheManager(this);
+        this.packetCacheManager.attachAlreadyOnline();
 
         this.recordingManager = new RecordingManager(this);
         this.serverProtocol = new ServerProtocol(this);
