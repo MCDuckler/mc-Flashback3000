@@ -205,13 +205,20 @@ public final class ModelEngineCompat {
             Class<?> dtIface = Class.forName("com.ticxo.modelengine.api.utils.data.tracker.DataTracker");
             dtGet = dtIface.getMethod("get");
 
-            // MountRenderer access (optional — vehicles with seats need this).
-            Class<?> behaviorTypeClass = Class.forName("com.ticxo.modelengine.api.model.bone.BoneBehaviorType");
+            present = true;
+        } catch (Throwable ignored) {}
+
+        // MountRenderer / behavior-renderer setup is OPTIONAL — kept in a separate try block
+        // so a class-path mismatch here doesn't drop the core DisplayRenderer reflection setup.
+        try {
+            Class<?> activeModelClass = Class.forName("com.ticxo.modelengine.api.model.ActiveModel");
+            Class<?> behaviorTypeClass = Class.forName("com.ticxo.modelengine.api.model.bone.behavior.BoneBehaviorType");
             getBehaviorRenderer = activeModelClass.getMethod("getBehaviorRenderer", behaviorTypeClass);
             Class<?> behaviorTypesClass = Class.forName("com.ticxo.modelengine.api.model.bone.BoneBehaviorTypes");
             boneBehaviorTypeMount = behaviorTypesClass.getField("MOUNT").get(null);
             mountRendererClass = Class.forName("com.ticxo.modelengine.api.model.bone.render.renderer.MountRenderer");
-            mountGetRendered = renderQueues.getMethod("getRendered");  // same getter, different generic type
+            Class<?> renderQueuesClass = Class.forName("com.ticxo.modelengine.api.model.bone.render.renderer.RenderQueues");
+            mountGetRendered = renderQueuesClass.getMethod("getRendered");
             Class<?> mountIface = Class.forName("com.ticxo.modelengine.api.model.bone.render.renderer.MountRenderer$Mount");
             mPId = mountIface.getMethod("getPivotId");
             mPUuid = mountIface.getMethod("getPivotUuid");
@@ -220,9 +227,15 @@ public final class ModelEngineCompat {
             mPos = mountIface.getMethod("getPosition");
             mYaw = mountIface.getMethod("getYaw");
             mPass = mountIface.getMethod("getPassengers");
-
-            present = true;
-        } catch (Throwable ignored) {}
+        } catch (Throwable t) {
+            // MountRenderer reflection unavailable — vehicles with seats won't work, but the
+            // DisplayRenderer path still produces bones / pivot / pivotMount packets.
+            getBehaviorRenderer = null;
+            boneBehaviorTypeMount = null;
+            mountRendererClass = null;
+            mountGetRendered = null;
+            mPId = mPUuid = mMId = mMUuid = mPos = mYaw = mPass = null;
+        }
 
         PRESENT = present;
         GET_MODELED_BUKKIT = getModeled;
