@@ -202,15 +202,51 @@ public final class EntityStateCache {
         // and avoids surprises for any consumer that processes packets in stream order.
         List<Map.Entry<Integer, State>> snapshot = new ArrayList<>(entities.entrySet());
 
+        // Snapshot current pos + passenger lists into local maps without holding multiple
+        // State locks at once. Used below to anchor each entity at its root vehicle's
+        // current position rather than its own stale AddEntity position.
+        record Pos(double x, double y, double z) {}
+        Map<Integer, Pos> currentPos = new java.util.HashMap<>(snapshot.size());
+        Map<Integer, Integer> passengerToVehicle = new java.util.HashMap<>();
+        for (Map.Entry<Integer, State> entry : snapshot) {
+            int id = entry.getKey();
+            State s = entry.getValue();
+            synchronized (s) {
+                currentPos.put(id, new Pos(s.x, s.y, s.z));
+                if (s.passengers != null) {
+                    int[] pids = s.passengers.getPassengers();
+                    int vehicle = s.passengers.getVehicle();
+                    for (int pid : pids) passengerToVehicle.put(pid, vehicle);
+                }
+            }
+        }
+
         for (Map.Entry<Integer, State> entry : snapshot) {
             int id = entry.getKey();
             if (id == recordingPlayerId) continue;
             State s = entry.getValue();
             synchronized (s) {
                 if (s.uuid == null || s.type == null) continue; // never saw AddEntity
+
+                // Walk passenger chain to root vehicle, anchor at root's current pos. ME
+                // bones (ITEM_DISPLAY) are passengers whose Display.tick override skips
+                // super.tick → rideTick → positionRider, so the client renders from the
+                // anchor set at AddEntity time forever. Native Flashback's client recorder
+                // reads the bone's CURRENT pos (which client-side positionRider has been
+                // updating to vehicle pos every tick) — we mimic by resolving the chain.
+                double x = s.x, y = s.y, z = s.z;
+                Integer vehicleId = passengerToVehicle.get(id);
+                int hops = 0;
+                while (vehicleId != null && hops++ < 16) {
+                    Pos vp = currentPos.get(vehicleId);
+                    if (vp == null) break;
+                    x = vp.x; y = vp.y; z = vp.z;
+                    vehicleId = passengerToVehicle.get(vehicleId);
+                }
+
                 out.accept(new ClientboundAddEntityPacket(
                         id, s.uuid,
-                        s.x, s.y, s.z,
+                        x, y, z,
                         s.xRot, s.yRot,
                         s.type, s.data, s.deltaMovement, s.yHeadRot));
 

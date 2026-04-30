@@ -5,6 +5,7 @@ import duckduck.flashback3000.netty.PacketCaptureHandler;
 import io.netty.channel.Channel;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
@@ -39,12 +40,20 @@ public final class PacketCacheManager implements Listener {
         return contexts.get(playerId);
     }
 
-    @EventHandler
+    /**
+     * LOWEST priority so this listener runs BEFORE other plugins' join handlers — critical for
+     * CTA's RidingCosmeticPacketAdapter, which emits ProtocolLib packets during its own onJoin
+     * to spawn the player's cosmetic-mount chain (SetPassengers chain anchored to the player).
+     * If F3K attached later in the dispatch order, those packets would fire before our channel
+     * handler is in the pipeline and the chain would be missing from every snapshot taken
+     * during this play session.
+     */
+    @EventHandler(priority = EventPriority.LOWEST)
     public void onJoin(PlayerJoinEvent event) {
         attach(event.getPlayer());
     }
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.MONITOR)
     public void onQuit(PlayerQuitEvent event) {
         contexts.remove(event.getPlayer().getUniqueId());
         // Channel handler is removed automatically when the channel closes; nothing to do here.
