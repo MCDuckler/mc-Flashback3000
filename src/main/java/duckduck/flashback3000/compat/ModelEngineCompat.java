@@ -82,6 +82,19 @@ public final class ModelEngineCompat {
     private static final Method BD_GET_UUID;
     private static final Method BD_GET_MODEL;           // -> DataTracker<ItemStack>
 
+    // MountRenderer accessors (for vehicles with seats — emits its own pivot/mount entities).
+    private static final Method GET_BEHAVIOR_RENDERER;  // ActiveModel.getBehaviorRenderer(BoneBehaviorType) -> Optional<BehaviorRenderer>
+    private static final Object BONE_BEHAVIOR_TYPE_MOUNT;
+    private static final Class<?> MOUNT_RENDERER_CLASS;
+    private static final Method MOUNT_GET_RENDERED;     // RenderQueues.getRendered() -> Map (reused for MountRenderer too)
+    private static final Method M_GET_PIVOT_ID;
+    private static final Method M_GET_PIVOT_UUID;
+    private static final Method M_GET_MOUNT_ID;
+    private static final Method M_GET_MOUNT_UUID;
+    private static final Method M_GET_POSITION;
+    private static final Method M_GET_YAW;
+    private static final Method M_GET_PASSENGERS;
+
     // DataTracker.get() — the value extractor for all the above.
     private static final Method DT_GET;
 
@@ -91,6 +104,20 @@ public final class ModelEngineCompat {
             new SynchedEntityData.DataValue<>(0, EntityDataSerializers.BYTE, (byte) 32),
             new SynchedEntityData.DataValue<>(1, EntityDataSerializers.INT, Integer.MAX_VALUE),
             new SynchedEntityData.DataValue<>(8, EntityDataSerializers.FLOAT, 0.0F)
+    );
+
+    // ME's mount-pivot (ITEM_DISPLAY) default data: id 0=byte flags, 1=interp tick, 10=teleport_duration.
+    private static final List<SynchedEntityData.DataValue<?>> DEFAULT_PIVOT_DISPLAY_DATA = List.of(
+            new SynchedEntityData.DataValue<>(0, EntityDataSerializers.BYTE, (byte) 32),
+            new SynchedEntityData.DataValue<>(1, EntityDataSerializers.INT, Integer.MAX_VALUE),
+            new SynchedEntityData.DataValue<>(10, EntityDataSerializers.INT, 1)
+    );
+
+    // ME's mount entity (ARMOR_STAND) default data: id 0=flags, 1=interp tick, 15=armor stand client flags (small=16).
+    private static final List<SynchedEntityData.DataValue<?>> DEFAULT_ARMOR_STAND_DATA = List.of(
+            new SynchedEntityData.DataValue<>(0, EntityDataSerializers.BYTE, (byte) 32),
+            new SynchedEntityData.DataValue<>(1, EntityDataSerializers.INT, Integer.MAX_VALUE),
+            new SynchedEntityData.DataValue<>(15, EntityDataSerializers.BYTE, (byte) 16)
     );
 
     static {
@@ -108,6 +135,12 @@ public final class ModelEngineCompat {
         Method boneDisplay = null, boneVis = null;
         Method bdId = null, bdUuid = null, bdModel = null;
         Method dtGet = null;
+        Method getBehaviorRenderer = null;
+        Object boneBehaviorTypeMount = null;
+        Class<?> mountRendererClass = null;
+        Method mountGetRendered = null;
+        Method mPId = null, mPUuid = null, mMId = null, mMUuid = null;
+        Method mPos = null, mYaw = null, mPass = null;
 
         try {
             Class<?> apiClass = Class.forName("com.ticxo.modelengine.api.ModelEngineAPI");
@@ -172,6 +205,22 @@ public final class ModelEngineCompat {
             Class<?> dtIface = Class.forName("com.ticxo.modelengine.api.utils.data.tracker.DataTracker");
             dtGet = dtIface.getMethod("get");
 
+            // MountRenderer access (optional — vehicles with seats need this).
+            Class<?> behaviorTypeClass = Class.forName("com.ticxo.modelengine.api.model.bone.BoneBehaviorType");
+            getBehaviorRenderer = activeModelClass.getMethod("getBehaviorRenderer", behaviorTypeClass);
+            Class<?> behaviorTypesClass = Class.forName("com.ticxo.modelengine.api.model.bone.BoneBehaviorTypes");
+            boneBehaviorTypeMount = behaviorTypesClass.getField("MOUNT").get(null);
+            mountRendererClass = Class.forName("com.ticxo.modelengine.api.model.bone.render.renderer.MountRenderer");
+            mountGetRendered = renderQueues.getMethod("getRendered");  // same getter, different generic type
+            Class<?> mountIface = Class.forName("com.ticxo.modelengine.api.model.bone.render.renderer.MountRenderer$Mount");
+            mPId = mountIface.getMethod("getPivotId");
+            mPUuid = mountIface.getMethod("getPivotUuid");
+            mMId = mountIface.getMethod("getMountId");
+            mMUuid = mountIface.getMethod("getMountUuid");
+            mPos = mountIface.getMethod("getPosition");
+            mYaw = mountIface.getMethod("getYaw");
+            mPass = mountIface.getMethod("getPassengers");
+
             present = true;
         } catch (Throwable ignored) {}
 
@@ -200,6 +249,13 @@ public final class ModelEngineCompat {
         BONE_GET_DISPLAY = boneDisplay; BONE_GET_VISIBILITY = boneVis;
         BD_GET_ID = bdId; BD_GET_UUID = bdUuid; BD_GET_MODEL = bdModel;
         DT_GET = dtGet;
+        GET_BEHAVIOR_RENDERER = getBehaviorRenderer;
+        BONE_BEHAVIOR_TYPE_MOUNT = boneBehaviorTypeMount;
+        MOUNT_RENDERER_CLASS = mountRendererClass;
+        MOUNT_GET_RENDERED = mountGetRendered;
+        M_GET_PIVOT_ID = mPId; M_GET_PIVOT_UUID = mPUuid;
+        M_GET_MOUNT_ID = mMId; M_GET_MOUNT_UUID = mMUuid;
+        M_GET_POSITION = mPos; M_GET_YAW = mYaw; M_GET_PASSENGERS = mPass;
     }
 
     private ModelEngineCompat() {}
@@ -267,20 +323,28 @@ public final class ModelEngineCompat {
         if (!PRESENT) return Collections.emptyList();
         Object modeled = getModeled(nmsBase);
         if (modeled == null) return Collections.emptyList();
+        List<Packet<? super ClientGamePacketListener>> out = new ArrayList<>();
         try {
             Map<?, ?> models = (Map<?, ?>) GET_MODELS.invoke(modeled);
             if (models == null || models.isEmpty()) return Collections.emptyList();
-            List<Packet<? super ClientGamePacketListener>> out = new ArrayList<>();
             for (Object activeModel : models.values()) {
-                Object renderer = GET_MODEL_RENDERER.invoke(activeModel);
-                if (renderer == null || !DISPLAY_RENDERER_CLASS.isInstance(renderer)) continue;
-                buildOneModel(out, renderer);
+                // Per-model try/catch so one bad ActiveModel doesn't lose the whole entity's bundle.
+                try {
+                    Object renderer = GET_MODEL_RENDERER.invoke(activeModel);
+                    if (renderer != null && DISPLAY_RENDERER_CLASS.isInstance(renderer)) {
+                        buildOneModel(out, renderer);
+                    }
+                    buildMounts(out, activeModel);
+                } catch (Throwable mt) {
+                    duckduck.flashback3000.Flashback3000.getInstance().getLogger()
+                            .warning("ME model spawn build failed for entity id " + nmsBase.getId() + ": " + mt);
+                }
             }
             return out;
         } catch (Throwable t) {
             duckduck.flashback3000.Flashback3000.getInstance().getLogger()
-                    .warning("ME spawn build failed for entity id " + nmsBase.getId() + ": " + t);
-            return Collections.emptyList();
+                    .warning("ME spawn build outer failure for entity id " + nmsBase.getId() + ": " + t);
+            return out;  // return whatever we managed to build before the throw
         }
     }
 
@@ -333,6 +397,69 @@ public final class ModelEngineCompat {
         // Hitbox / shadow (fire is omitted — rarely visible at snapshot time and would
         // bloat the spawn bundle; ME's natural updateRealtime restores it post-snapshot).
         buildHitbox(out, hitbox);
+    }
+
+    /**
+     * Mirrors {@code MountParser.spawn} per active mount: emits the mount-pivot
+     * (ITEM_DISPLAY) and the mount entity (ARMOR_STAND), plus the SetPassengers
+     * chain that binds {@code mount-pivot → mount → [actual passengers]}.
+     *
+     * <p>Without this, vehicles using ME's mount renderer (UltraCars seats etc.)
+     * have a model pivot whose dynamicId points at a mount-pivot ID that never
+     * exists on playback — so SetPassengers binding the model bones to that
+     * dynamicId silently fails and bones stay frozen at spawn position.
+     */
+    private static void buildMounts(List<Packet<? super ClientGamePacketListener>> out, Object activeModel) throws Throwable {
+        if (GET_BEHAVIOR_RENDERER == null || BONE_BEHAVIOR_TYPE_MOUNT == null) return;
+        Object maybeRenderer = GET_BEHAVIOR_RENDERER.invoke(activeModel, BONE_BEHAVIOR_TYPE_MOUNT);
+        if (maybeRenderer == null) return;
+        // Optional<BehaviorRenderer> — unwrap.
+        java.util.Optional<?> opt = (java.util.Optional<?>) maybeRenderer;
+        if (opt.isEmpty()) return;
+        Object mountRenderer = opt.get();
+        if (!MOUNT_RENDERER_CLASS.isInstance(mountRenderer)) return;
+
+        Map<?, ?> mounts = (Map<?, ?>) MOUNT_GET_RENDERED.invoke(mountRenderer);
+        if (mounts == null) return;
+
+        for (Object mount : mounts.values()) {
+            int pivotId = (Integer) M_GET_PIVOT_ID.invoke(mount);
+            UUID pivotUuid = (UUID) M_GET_PIVOT_UUID.invoke(mount);
+            int mountId = (Integer) M_GET_MOUNT_ID.invoke(mount);
+            UUID mountUuid = (UUID) M_GET_MOUNT_UUID.invoke(mount);
+            Vector3f pos = (Vector3f) DT_GET.invoke(M_GET_POSITION.invoke(mount));
+            byte yawByte = (Byte) DT_GET.invoke(M_GET_YAW.invoke(mount));
+            float yawDeg = byteToRot(yawByte);
+            @SuppressWarnings("unchecked")
+            Collection<Integer> passengerObjs = (Collection<Integer>) DT_GET.invoke(M_GET_PASSENGERS.invoke(mount));
+
+            // Mount-pivot: ITEM_DISPLAY at the mount position.
+            out.add(new ClientboundAddEntityPacket(
+                    pivotId, pivotUuid,
+                    pos.x, pos.y, pos.z,
+                    0f, 0f, EntityType.ITEM_DISPLAY, 0, Vec3.ZERO, 0));
+            out.add(new ClientboundSetEntityDataPacket(pivotId, DEFAULT_PIVOT_DISPLAY_DATA));
+
+            // Mount entity: ARMOR_STAND with current yaw.
+            out.add(new ClientboundAddEntityPacket(
+                    mountId, mountUuid,
+                    pos.x, pos.y, pos.z,
+                    0f, yawDeg, EntityType.ARMOR_STAND, 0, Vec3.ZERO, 0));
+            out.add(new ClientboundSetEntityDataPacket(mountId, DEFAULT_ARMOR_STAND_DATA));
+
+            // SetPassengers: pivot has the mount as its single passenger; the mount
+            // has the actual rider entity ids (typically the player riding).
+            out.add(buildSetPassengers(pivotId, new int[]{mountId}));
+            int[] actualPassengers = new int[passengerObjs.size()];
+            int i = 0;
+            for (Integer id : passengerObjs) actualPassengers[i++] = id;
+            out.add(buildSetPassengers(mountId, actualPassengers));
+        }
+    }
+
+    /** Mirrors ME's TMath.byteToRot — convert NMS byte angle to float degrees. */
+    private static float byteToRot(byte b) {
+        return (b & 0xFF) * 360f / 256f;
     }
 
     private static ClientboundSetEntityDataPacket buildBoneData(Object bone, Object boneData, int boneId) throws Throwable {
