@@ -40,6 +40,7 @@ public final class ModelEngineCompat {
     private static final Method GET_PIVOT;           // DisplayRenderer.getPivot()
     private static final Method GET_HITBOX;          // DisplayRenderer.getHitbox()
     private static final Method GET_RENDERED;        // RenderQueues.getRendered() -> Map<String, DisplayBone>
+    private static final Method GET_SPAWN_QUEUE;     // RenderQueues.getSpawnQueue() -> Map<String, DisplayBone>
 
     // Pivot accessors.
     private static final Method PIVOT_GET_ID;
@@ -63,6 +64,14 @@ public final class ModelEngineCompat {
     private static final Method HB_IS_PIVOT_VISIBLE;
     private static final Method HB_IS_HITBOX_VISIBLE;
     private static final Method HB_IS_SHADOW_VISIBLE;
+    private static final Method HB_IS_FIRE_VISIBLE;
+    private static final Method HB_GET_FIRE_DISPLAY;
+    private static final Method POOLED_GET_IN_USE;
+    private static final Method FIRE_GET_ID;
+    private static final Method FIRE_GET_UUID;
+    private static final Method FIRE_GET_POSITION;
+    private static final Method FIRE_GET_SCALE;
+    private static final Method FIRE_GET_FIRE_MODEL;
 
     // DisplayBone accessors.
     private static final Method BONE_GET_MODEL_MAP;     // DisplayBone.getModel() -> Map<Integer, BoneData>
@@ -141,6 +150,9 @@ public final class ModelEngineCompat {
         Method mountGetRendered = null;
         Method mPId = null, mPUuid = null, mMId = null, mMUuid = null;
         Method mPos = null, mYaw = null, mPass = null;
+        Method getSpawnQueue = null;
+        Method hFireVis = null, hFireDisplay = null, pooledGetInUse = null;
+        Method fireId = null, fireUuid = null, firePos = null, fireScale = null, fireModel = null;
 
         try {
             Class<?> apiClass = Class.forName("com.ticxo.modelengine.api.ModelEngineAPI");
@@ -157,9 +169,10 @@ public final class ModelEngineCompat {
             displayRendererClass = Class.forName("com.ticxo.modelengine.api.model.render.DisplayRenderer");
             getPivot = displayRendererClass.getMethod("getPivot");
             getHitbox = displayRendererClass.getMethod("getHitbox");
-            // getRendered is on RenderQueues which DisplayRenderer extends.
+            // getRendered / getSpawnQueue are on RenderQueues which DisplayRenderer extends.
             Class<?> renderQueues = Class.forName("com.ticxo.modelengine.api.model.bone.render.renderer.RenderQueues");
             getRendered = renderQueues.getMethod("getRendered");
+            getSpawnQueue = renderQueues.getMethod("getSpawnQueue");
 
             Class<?> pivotIface = Class.forName("com.ticxo.modelengine.api.model.render.DisplayRenderer$Pivot");
             pId = pivotIface.getMethod("getId");
@@ -183,6 +196,18 @@ public final class ModelEngineCompat {
             hPVis = hitboxIface.getMethod("isPivotVisible");
             hHVis = hitboxIface.getMethod("isHitboxVisible");
             hSVis = hitboxIface.getMethod("isShadowVisible");
+            hFireVis = hitboxIface.getMethod("isFireVisible");
+            hFireDisplay = hitboxIface.getMethod("getFireDisplay");
+
+            Class<?> pooledClass = Class.forName("com.ticxo.modelengine.api.utils.data.PooledCollection");
+            pooledGetInUse = pooledClass.getMethod("getInUse");
+
+            Class<?> displayFireClass = Class.forName("com.ticxo.modelengine.api.model.render.DisplayFire");
+            fireId = displayFireClass.getMethod("getId");
+            fireUuid = displayFireClass.getMethod("getUuid");
+            firePos = displayFireClass.getMethod("getPosition");
+            fireScale = displayFireClass.getMethod("getScale");
+            fireModel = displayFireClass.getMethod("getFireModel");
 
             Class<?> boneIface = Class.forName("com.ticxo.modelengine.api.model.render.DisplayBone");
             boneModelMap = boneIface.getMethod("getModel");
@@ -247,6 +272,7 @@ public final class ModelEngineCompat {
         GET_PIVOT = getPivot;
         GET_HITBOX = getHitbox;
         GET_RENDERED = getRendered;
+        GET_SPAWN_QUEUE = getSpawnQueue;
         PIVOT_GET_ID = pId; PIVOT_GET_UUID = pUuid; PIVOT_IS_OVERRIDDEN = pOver;
         PIVOT_GET_DYNAMIC_ID = pDyn; PIVOT_GET_POSITION = pPos; PIVOT_GET_PASSENGERS = pPass;
         HB_GET_PIVOT_ID = hPivotId; HB_GET_PIVOT_UUID = hPivotUuid;
@@ -254,6 +280,10 @@ public final class ModelEngineCompat {
         HB_GET_SHADOW_ID = hShadId; HB_GET_SHADOW_UUID = hShadUuid;
         HB_GET_POSITION = hPos; HB_GET_WIDTH = hWidth; HB_GET_HEIGHT = hHeight; HB_GET_SHADOW_RADIUS = hShadRad;
         HB_IS_PIVOT_VISIBLE = hPVis; HB_IS_HITBOX_VISIBLE = hHVis; HB_IS_SHADOW_VISIBLE = hSVis;
+        HB_IS_FIRE_VISIBLE = hFireVis; HB_GET_FIRE_DISPLAY = hFireDisplay;
+        POOLED_GET_IN_USE = pooledGetInUse;
+        FIRE_GET_ID = fireId; FIRE_GET_UUID = fireUuid;
+        FIRE_GET_POSITION = firePos; FIRE_GET_SCALE = fireScale; FIRE_GET_FIRE_MODEL = fireModel;
         BONE_GET_MODEL_MAP = boneModelMap;
         BONE_GET_POSITION = bonePos; BONE_GET_SCALE = boneScale;
         BONE_GET_LEFT_ROT = boneLRot; BONE_GET_RIGHT_ROT = boneRRot;
@@ -382,21 +412,13 @@ public final class ModelEngineCompat {
             out.add(new ClientboundSetEntityDataPacket(pivotId, DEFAULT_AREA_EFFECT_CLOUD_DATA));
         }
 
-        // Bone displays.
-        if (bones != null) {
-            for (Object bone : bones.values()) {
-                Map<?, ?> boneDataMap = (Map<?, ?>) BONE_GET_MODEL_MAP.invoke(bone);
-                if (boneDataMap == null) continue;
-                for (Object boneData : boneDataMap.values()) {
-                    int bId = (Integer) BD_GET_ID.invoke(boneData);
-                    UUID bUuid = (UUID) BD_GET_UUID.invoke(boneData);
-                    out.add(new ClientboundAddEntityPacket(
-                            bId, bUuid,
-                            pivotPos.x, pivotPos.y, pivotPos.z,
-                            0f, 0f, EntityType.ITEM_DISPLAY, 0, Vec3.ZERO, 0));
-                    out.add(buildBoneData(bone, boneData, bId));
-                }
-            }
+        // Bone displays — iterate BOTH rendered and spawnQueue (DisplayParser.spawn does the same).
+        // Bones in spawnQueue are pending first-render and have IDs already in pivot.passengers,
+        // so without this we'd emit SetPassengers with IDs that have no corresponding AddEntity.
+        emitBones(out, bones, pivotPos);
+        if (GET_SPAWN_QUEUE != null) {
+            Map<?, ?> spawnQueue = (Map<?, ?>) GET_SPAWN_QUEUE.invoke(renderer);
+            emitBones(out, spawnQueue, pivotPos);
         }
 
         // pivotMount: bind all bone IDs as passengers of the pivot's dynamic id.
@@ -410,6 +432,23 @@ public final class ModelEngineCompat {
         // Hitbox / shadow (fire is omitted — rarely visible at snapshot time and would
         // bloat the spawn bundle; ME's natural updateRealtime restores it post-snapshot).
         buildHitbox(out, hitbox);
+    }
+
+    private static void emitBones(List<Packet<? super ClientGamePacketListener>> out, Map<?, ?> bones, Vector3f pivotPos) throws Throwable {
+        if (bones == null) return;
+        for (Object bone : bones.values()) {
+            Map<?, ?> boneDataMap = (Map<?, ?>) BONE_GET_MODEL_MAP.invoke(bone);
+            if (boneDataMap == null) continue;
+            for (Object boneData : boneDataMap.values()) {
+                int bId = (Integer) BD_GET_ID.invoke(boneData);
+                UUID bUuid = (UUID) BD_GET_UUID.invoke(boneData);
+                out.add(new ClientboundAddEntityPacket(
+                        bId, bUuid,
+                        pivotPos.x, pivotPos.y, pivotPos.z,
+                        0f, 0f, EntityType.ITEM_DISPLAY, 0, Vec3.ZERO, 0));
+                out.add(buildBoneData(bone, boneData, bId));
+            }
+        }
     }
 
     /**
@@ -576,6 +615,51 @@ public final class ModelEngineCompat {
             data.add(new SynchedEntityData.DataValue<>(18, EntityDataSerializers.FLOAT, radius));
             out.add(new ClientboundSetEntityDataPacket(shadowId, data));
             mountPassengers.add(shadowId);
+        }
+
+        // Fire display entities — ME emits these when the entity is on fire and visibility allows.
+        // Each fire is its own ITEM_DISPLAY mounted on the hitbox-pivot.
+        if (HB_IS_FIRE_VISIBLE != null && HB_GET_FIRE_DISPLAY != null && POOLED_GET_IN_USE != null) {
+            try {
+                boolean fireVisible = (Boolean) HB_IS_FIRE_VISIBLE.invoke(hitbox);
+                if (fireVisible) {
+                    Object fireDisplay = HB_GET_FIRE_DISPLAY.invoke(hitbox);
+                    Iterable<?> inUse = (Iterable<?>) POOLED_GET_IN_USE.invoke(fireDisplay);
+                    if (inUse != null) {
+                        for (Object fire : inUse) {
+                            int fId = (Integer) FIRE_GET_ID.invoke(fire);
+                            UUID fUuid = (UUID) FIRE_GET_UUID.invoke(fire);
+                            Vector3f fPos = (Vector3f) DT_GET.invoke(FIRE_GET_POSITION.invoke(fire));
+                            Vector3f fScale = (Vector3f) DT_GET.invoke(FIRE_GET_SCALE.invoke(fire));
+                            Object fItem = DT_GET.invoke(FIRE_GET_FIRE_MODEL.invoke(fire));
+                            net.minecraft.world.item.ItemStack nmsItem = fItem == null
+                                    ? net.minecraft.world.item.ItemStack.EMPTY
+                                    : CraftItemStack.asNMSCopy((org.bukkit.inventory.ItemStack) fItem);
+                            out.add(new ClientboundAddEntityPacket(
+                                    fId, fUuid,
+                                    hPos.x, hPos.y, hPos.z,
+                                    0f, 0f, EntityType.ITEM_DISPLAY, 0, Vec3.ZERO, 0));
+                            // Force-spawn shape mirrors DisplayParser.fireData(spawn=true):
+                            // 1=interp tick, 15=billboard (VERTICAL=2), 16=brightness (full),
+                            // 23=item, 11=position, 12=scale, 17=visibility.
+                            List<SynchedEntityData.DataValue<?>> fdata = new ArrayList<>(7);
+                            fdata.add(new SynchedEntityData.DataValue<>(1, EntityDataSerializers.INT, Integer.MAX_VALUE));
+                            fdata.add(new SynchedEntityData.DataValue<>(15, EntityDataSerializers.BYTE, (byte) net.minecraft.world.entity.Display.BillboardConstraints.VERTICAL.ordinal()));
+                            fdata.add(new SynchedEntityData.DataValue<>(16, EntityDataSerializers.INT, net.minecraft.util.Brightness.FULL_BRIGHT.pack()));
+                            fdata.add(new SynchedEntityData.DataValue<>(23, EntityDataSerializers.ITEM_STACK, nmsItem));
+                            fdata.add(new SynchedEntityData.DataValue<>(11, EntityDataSerializers.VECTOR3, fPos));
+                            fdata.add(new SynchedEntityData.DataValue<>(12, EntityDataSerializers.VECTOR3, fScale));
+                            fdata.add(new SynchedEntityData.DataValue<>(17, EntityDataSerializers.FLOAT, 4096.0F));
+                            out.add(new ClientboundSetEntityDataPacket(fId, fdata));
+                            mountPassengers.add(fId);
+                        }
+                    }
+                }
+            } catch (Throwable t) {
+                // Fire reflection failed — non-fatal; vehicle hitbox still emits without fire.
+                duckduck.flashback3000.Flashback3000.getInstance().getLogger()
+                        .fine("ME fire display reflection failed: " + t);
+            }
         }
 
         if (!mountPassengers.isEmpty()) {
