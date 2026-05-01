@@ -11,7 +11,15 @@ import net.minecraft.network.protocol.common.ClientboundKeepAlivePacket;
 import net.minecraft.network.protocol.common.ServerboundCustomPayloadPacket;
 import net.minecraft.network.protocol.common.ServerboundKeepAlivePacket;
 import net.minecraft.network.protocol.common.ServerboundPongPacket;
+import net.minecraft.network.protocol.game.ClientboundAddEntityPacket;
+import net.minecraft.network.protocol.game.ClientboundRemoveEntitiesPacket;
 import net.minecraft.network.protocol.game.ClientboundSetEntityDataPacket;
+import net.minecraft.network.syncher.EntityDataSerializers;
+import net.minecraft.network.syncher.SynchedEntityData;
+import net.minecraft.world.entity.EntityType;
+
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class PlaybackFilter extends ChannelDuplexHandler {
 
@@ -20,6 +28,7 @@ public class PlaybackFilter extends ChannelDuplexHandler {
     private static final java.util.Set<String> SEEN = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     private volatile boolean active = true;
+    private static final Map<Integer, EntityType<?>> TRACKED_ENTITY_TYPES = new ConcurrentHashMap<>();
 
     public void setActive(boolean active) {
         this.active = active;
@@ -31,6 +40,9 @@ public class PlaybackFilter extends ChannelDuplexHandler {
 
     @Override
     public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
+        // Track entity types as they flow outbound so we can validate later
+        // SetEntityData packets against vanilla's expected per-field types.
+        recordEntityTracking(msg);
         if (msg instanceof PlaybackPacket wrapper) {
             Object inner = wrapper.packet();
             traceOnce("playback", inner);
@@ -71,14 +83,61 @@ public class PlaybackFilter extends ChannelDuplexHandler {
     private static boolean isDangerousForVanilla(Object msg) {
         if (msg == null) return false;
         Object inner = unwrapProtected(msg);
-        if (inner instanceof ClientboundSetEntityDataPacket sed) return hasHighField(sed);
+        if (inner instanceof ClientboundSetEntityDataPacket sed) return isUnsafeSetEntityData(sed);
         if (inner instanceof BundlePacket<?> bp) {
             for (Packet<?> sub : bp.subPackets()) {
                 Object subInner = unwrapProtected(sub);
-                if (subInner instanceof ClientboundSetEntityDataPacket sed && hasHighField(sed)) return true;
+                if (subInner instanceof ClientboundSetEntityDataPacket sed && isUnsafeSetEntityData(sed)) return true;
             }
         }
         return false;
+    }
+
+    private static boolean isUnsafeSetEntityData(ClientboundSetEntityDataPacket sed) {
+        if (hasHighField(sed)) return true;
+        EntityType<?> type = TRACKED_ENTITY_TYPES.get(sed.id());
+        if (isDisplayVariant(type) && hasInvalidDisplayFieldType(sed)) return true;
+        return false;
+    }
+
+    private static boolean isDisplayVariant(EntityType<?> type) {
+        return type == EntityType.ITEM_DISPLAY
+                || type == EntityType.BLOCK_DISPLAY
+                || type == EntityType.TEXT_DISPLAY;
+    }
+
+    /**
+     * Display variants register strict per-field serializers in vanilla:
+     * fields 8 / 9 / 10 are Integer (interpolation timing), 11 / 12 are Vector3,
+     * 13 / 14 are Quaternion, 15 is Byte, 16 is Integer, 17-21 are Float, 22 is
+     * Integer. ModelEngine emits some of these with a Float serializer where
+     * vanilla expects Integer (e.g. field 9 = transformation_interpolation_
+     * duration), causing the client's DataTracker to throw IllegalStateException
+     * during bundle apply -> "Network Protocol Error" disconnect. Drop those
+     * specific malformed packets. The threshold is conservative on the integer-
+     * typed fields where we've seen mismatches in the wild.
+     */
+    private static boolean hasInvalidDisplayFieldType(ClientboundSetEntityDataPacket sed) {
+        for (SynchedEntityData.DataValue<?> dv : sed.packedItems()) {
+            int id = dv.id();
+            if (id == 8 || id == 9 || id == 10 || id == 16 || id == 22) {
+                if (dv.serializer() != EntityDataSerializers.INT) return true;
+            } else if (id == 15) {
+                if (dv.serializer() != EntityDataSerializers.BYTE) return true;
+            }
+        }
+        return false;
+    }
+
+    private static void recordEntityTracking(Object msg) {
+        Object inner = unwrapProtected(msg);
+        if (inner instanceof ClientboundAddEntityPacket add) {
+            TRACKED_ENTITY_TYPES.put(add.getId(), add.getType());
+        } else if (inner instanceof ClientboundRemoveEntitiesPacket rem) {
+            for (int id : rem.getEntityIds()) TRACKED_ENTITY_TYPES.remove(id);
+        } else if (inner instanceof BundlePacket<?> bp) {
+            for (Packet<?> sub : bp.subPackets()) recordEntityTracking(sub);
+        }
     }
 
     /**
