@@ -70,20 +70,36 @@ public class PlaybackFilter extends ChannelDuplexHandler {
      */
     private static boolean isDangerousForVanilla(Object msg) {
         if (msg == null) return false;
-        if (isProtectedPacket(msg.getClass())) return true;
-        if (msg instanceof ClientboundSetEntityDataPacket sed) return hasHighField(sed);
-        if (msg instanceof BundlePacket<?> bp) {
+        Object inner = unwrapProtected(msg);
+        if (inner instanceof ClientboundSetEntityDataPacket sed) return hasHighField(sed);
+        if (inner instanceof BundlePacket<?> bp) {
             for (Packet<?> sub : bp.subPackets()) {
-                if (sub == null) continue;
-                if (isProtectedPacket(sub.getClass())) return true;
-                if (sub instanceof ClientboundSetEntityDataPacket sed && hasHighField(sed)) return true;
+                Object subInner = unwrapProtected(sub);
+                if (subInner instanceof ClientboundSetEntityDataPacket sed && hasHighField(sed)) return true;
             }
         }
         return false;
     }
 
-    private static boolean isProtectedPacket(Class<?> c) {
-        return c.getName().startsWith("com.ticxo.modelengine.");
+    /**
+     * ModelEngine wraps certain packets in {@code ProtectedPacket} (a record
+     * holding the real Packet under {@code .packet()}). Their pipeline handler
+     * {@code ProtectedPacketUnpacker} strips the wrapper before the encoder runs,
+     * so the wrapper itself is harmless to vanilla clients - but it hides the
+     * inner packet from our safety check. Unwrap reflectively (we don't compile
+     * against ModelEngine) so we evaluate dangerousness on the true payload.
+     */
+    private static Object unwrapProtected(Object msg) {
+        if (msg == null) return null;
+        Class<?> cls = msg.getClass();
+        if (!"com.ticxo.modelengine.api.nms.network.ProtectedPacket".equals(cls.getName())) {
+            return msg;
+        }
+        try {
+            return cls.getMethod("packet").invoke(msg);
+        } catch (Throwable t) {
+            return msg;
+        }
     }
 
     private static boolean hasHighField(ClientboundSetEntityDataPacket sed) {
