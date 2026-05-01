@@ -427,10 +427,12 @@ public class PlaybackSession {
             if (this.task != null) { this.task.cancel(); this.task = null; }
             if (this.plan != null && !this.plan.isLast(this.segmentIndex)) {
                 // Black fade covers the inter-segment hand-off (entity unwind +
-                // chunk forget + new snapshot dispatch). 4t fade-in, 12t hold,
-                // 4t fade-out. Advance fires once we're fully black.
-                sendBlackFade(4, 12, 4);
-                Bukkit.getScheduler().runTaskLater(this.plugin, this::advanceToNextSegment, 4L);
+                // chunk forget + new snapshot dispatch). Match CinematicTeleport
+                // timings: 900ms in, 600ms hold, 1200ms out (18t / 12t / 24t).
+                // Advance fires (FADE_IN_TICKS + 3) ticks in, when the wipe is
+                // fully closed — same offset CinematicTeleport uses.
+                sendBlackFade(18, 12, 24);
+                Bukkit.getScheduler().runTaskLater(this.plugin, this::advanceToNextSegment, 21L);
             } else {
                 finish("Trailer complete");
             }
