@@ -108,6 +108,7 @@ public class PlaybackSession {
     private static final int SKIP_TICKS_PER_PASS = 200;
 
     public void start() {
+        PlaybackFilter.resetTrace();
         this.channel.eventLoop().execute(() -> {
             try {
                 if (this.channel.pipeline().get(PlaybackFilter.NAME) == null) {
