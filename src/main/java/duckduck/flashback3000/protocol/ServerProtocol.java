@@ -18,6 +18,7 @@ import org.jetbrains.annotations.NotNull;
 import java.io.ByteArrayInputStream;
 import java.io.DataInputStream;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
@@ -36,6 +37,7 @@ public class ServerProtocol implements PluginMessageListener, Listener {
     private final Map<UUID, DownloadSession> downloads = new ConcurrentHashMap<>();
     private final Map<UUID, ScheduledFuture<?>> pumpTasks = new ConcurrentHashMap<>();
     private final Map<UUID, UploadSession> uploads = new ConcurrentHashMap<>();
+    private final Map<UUID, ReplayUploadSession> replayUploads = new ConcurrentHashMap<>();
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "Flashback3000-DownloadPump");
         t.setDaemon(true);
@@ -75,6 +77,8 @@ public class ServerProtocol implements PluginMessageListener, Listener {
         this.pumpTasks.clear();
         for (UploadSession us : this.uploads.values()) us.close();
         this.uploads.clear();
+        for (ReplayUploadSession rs : this.replayUploads.values()) rs.close();
+        this.replayUploads.clear();
         this.scheduler.shutdownNow();
     }
 
@@ -107,6 +111,9 @@ public class ServerProtocol implements PluginMessageListener, Listener {
             case PacketIds.PLAY_SCENE_REQUEST -> handlePlayScene(player, Wire.readUUID(in), in.readUTF(), in.readByte());
             case PacketIds.PLAY_TRAILER_REQUEST -> handlePlayTrailer(player, in);
             case PacketIds.CANCEL_PLAYBACK -> handleCancelPlayback(player);
+            case PacketIds.UPLOAD_REPLAY_START -> handleUploadReplayStart(player, Wire.readUUID(in), in.readLong(), in.readInt(), in.readInt(), in.readUTF());
+            case PacketIds.UPLOAD_REPLAY_CHUNK -> handleUploadReplayChunk(player, Wire.readUUID(in), in.readInt(), in.readInt(), Wire.readBytes(in));
+            case PacketIds.UPLOAD_REPLAY_END -> handleUploadReplayEnd(player, Wire.readUUID(in));
             default -> this.plugin.getLogger().warning("Unknown opcode 0x" + Integer.toHexString(op & 0xFF));
         }
     }
@@ -521,6 +528,125 @@ public class ServerProtocol implements PluginMessageListener, Listener {
             this.plugin.getPlaybackManager().cancel(player);
             sendPlaybackStatus(player, false, new UUID(0L, 0L), "", "Cancelled");
         });
+    }
+
+    // -------- replay upload --------
+
+    private void handleUploadReplayStart(Player player, UUID receiptId, long totalSize,
+                                         int chunkCount, int chunkSize, String suggestedName) {
+        if (!checkAdmin(player)) return;
+        if (totalSize < 0 || totalSize > PacketIds.UPLOAD_REPLAY_MAX_BYTES) {
+            sendUploadReplayResult(player, receiptId, false, "Upload too large", null);
+            return;
+        }
+        if (chunkCount <= 0 || chunkSize <= 0 || chunkSize > 1024 * 1024) {
+            sendUploadReplayResult(player, receiptId, false, "Bad chunk parameters", null);
+            return;
+        }
+        ReplayUploadSession existing = this.replayUploads.remove(receiptId);
+        if (existing != null) existing.close();
+        try {
+            Path tmpDir = this.plugin.getDataFolder().toPath().resolve("uploads");
+            ReplayUploadSession session = new ReplayUploadSession(receiptId, totalSize, chunkCount,
+                    suggestedName, tmpDir);
+            this.replayUploads.put(receiptId, session);
+        } catch (IOException e) {
+            sendUploadReplayResult(player, receiptId, false, "Failed to open upload buffer: " + e.getMessage(), null);
+        }
+    }
+
+    private void handleUploadReplayChunk(Player player, UUID receiptId, int chunkIndex,
+                                         int chunkSize, byte[] data) {
+        ReplayUploadSession session = this.replayUploads.get(receiptId);
+        if (session == null) return;
+        if (session.receivedBytes() + data.length > PacketIds.UPLOAD_REPLAY_MAX_BYTES) {
+            this.replayUploads.remove(receiptId);
+            session.close();
+            sendUploadReplayResult(player, receiptId, false, "Upload exceeded size cap", null);
+            return;
+        }
+        try {
+            if (session.acceptChunk(chunkIndex, data, chunkSize)) {
+                send(player, Wire.build(PacketIds.UPLOAD_REPLAY_ACK, out -> {
+                    try {
+                        Wire.writeUUID(out, receiptId);
+                        out.writeInt(chunkIndex);
+                    } catch (IOException ignored) {}
+                }));
+            }
+        } catch (IOException e) {
+            this.replayUploads.remove(receiptId);
+            session.close();
+            sendUploadReplayResult(player, receiptId, false, "Write failed: " + e.getMessage(), null);
+        }
+    }
+
+    private void handleUploadReplayEnd(Player player, UUID receiptId) {
+        ReplayUploadSession session = this.replayUploads.remove(receiptId);
+        if (session == null) {
+            sendUploadReplayResult(player, receiptId, false, "No active upload", null);
+            return;
+        }
+        if (!session.isComplete()) {
+            session.close();
+            sendUploadReplayResult(player, receiptId, false, "Upload incomplete", null);
+            return;
+        }
+        // Close file handle but keep the tmp file so we can move/validate it.
+        session.closeKeepingFile();
+        Bukkit.getScheduler().runTaskAsynchronously(this.plugin, () -> {
+            UUID resolvedUuid = null;
+            String message;
+            try {
+                Path tmp = session.tmpFile();
+                ReplayLibrary.Entry validated;
+                try {
+                    validated = this.library.read(tmp);
+                } catch (Throwable t) {
+                    Files.deleteIfExists(tmp);
+                    sendUploadReplayResult(player, receiptId, false, "Read failed: " + t.getMessage(), null);
+                    return;
+                }
+                if (validated == null) {
+                    Files.deleteIfExists(tmp);
+                    sendUploadReplayResult(player, receiptId, false, "Not a valid Flashback recording (missing or unreadable metadata.json)", null);
+                    return;
+                }
+                resolvedUuid = validated.uuid();
+                String safe = (validated.name() == null || validated.name().isBlank()
+                        ? resolvedUuid.toString()
+                        : validated.name()).replaceAll("[^A-Za-z0-9._-]", "_");
+                if (safe.isBlank()) safe = resolvedUuid.toString();
+                Path target = this.library.root().resolve(safe + ".zip");
+                int dedupe = 1;
+                while (Files.exists(target)) {
+                    target = this.library.root().resolve(safe + "-" + (dedupe++) + ".zip");
+                }
+                Files.move(tmp, target, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+                message = "Saved " + target.getFileName() + " (" + (validated.sizeBytes() / 1024) + " KiB)";
+                this.plugin.getLogger().info("Replay upload from " + player.getName()
+                        + ": " + target.getFileName() + " uuid=" + resolvedUuid);
+            } catch (Throwable t) {
+                this.plugin.getLogger().warning("Replay upload finalize failed: " + t);
+                sendUploadReplayResult(player, receiptId, false, "Finalize failed: " + t.getMessage(), null);
+                return;
+            }
+            sendUploadReplayResult(player, receiptId, true, message, resolvedUuid);
+            // Notify mod-side replay list.
+            handleListReplays(player);
+        });
+    }
+
+    private void sendUploadReplayResult(Player player, UUID receiptId, boolean ok,
+                                        String msg, @org.jetbrains.annotations.Nullable UUID replayId) {
+        send(player, Wire.build(PacketIds.UPLOAD_REPLAY_RESULT, out -> {
+            try {
+                Wire.writeUUID(out, receiptId);
+                out.writeBoolean(ok);
+                out.writeUTF(msg == null ? "" : msg);
+                Wire.writeUUID(out, replayId == null ? new UUID(0L, 0L) : replayId);
+            } catch (IOException ignored) {}
+        }));
     }
 
     public void sendPlaybackStatus(Player player, boolean active, UUID replayId, String sceneId, String msg) {

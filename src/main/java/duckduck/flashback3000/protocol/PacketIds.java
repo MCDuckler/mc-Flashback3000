@@ -41,6 +41,14 @@ public final class PacketIds {
     public static final byte PLAYBACK_STATUS = 0x62;
     public static final byte PLAY_TRAILER_REQUEST = 0x63;
 
+    public static final byte UPLOAD_REPLAY_START = 0x70;
+    public static final byte UPLOAD_REPLAY_CHUNK = 0x71;
+    public static final byte UPLOAD_REPLAY_ACK = 0x72;
+    public static final byte UPLOAD_REPLAY_END = 0x73;
+    public static final byte UPLOAD_REPLAY_RESULT = 0x74;
+
+    public static final int UPLOAD_REPLAY_MAX_BYTES = 256 * 1024 * 1024; // 256 MiB
+
     public static final byte END_RESTORE = 0x00;
     public static final byte END_KICK    = 0x01;
 
