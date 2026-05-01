@@ -286,20 +286,25 @@ public class PlaybackSession {
      * sprite. Falls back to a normal small character on viewers without the
      * resource pack but the function still runs harmlessly.
      */
-    private void sendBlackFade(int fadeInMs, int stayMs, int fadeOutMs) {
+    private void sendBlackFade(int fadeInTicks, int stayTicks, int fadeOutTicks) {
         try {
-            net.kyori.adventure.title.Title.Times times = net.kyori.adventure.title.Title.Times.times(
-                    java.time.Duration.ofMillis(fadeInMs),
-                    java.time.Duration.ofMillis(stayMs),
-                    java.time.Duration.ofMillis(fadeOutMs));
             // U+D47F: the same character Toolbox3000's ScreenFade uses; the CTA
             // resource-pack font maps it to a full-screen black sprite.
-            net.kyori.adventure.text.Component black = net.kyori.adventure.text.Component
+            net.kyori.adventure.text.Component adv = net.kyori.adventure.text.Component
                     .text("푿")
                     .color(net.kyori.adventure.text.format.NamedTextColor.BLACK);
-            net.kyori.adventure.title.Title title = net.kyori.adventure.title.Title.title(
-                    black, net.kyori.adventure.text.Component.empty(), times);
-            this.bukkitPlayer.showTitle(title);
+            net.minecraft.network.chat.Component nms = io.papermc.paper.adventure.PaperAdventure.asVanilla(adv);
+            net.minecraft.network.chat.Component empty = net.minecraft.network.chat.Component.empty();
+            // PlaybackPacket wrapper bypasses the active filter (player.showTitle
+            // would be dropped because the filter blocks all real-server traffic
+            // while a session is active).
+            this.channel.write(new PlaybackPacket(
+                    new net.minecraft.network.protocol.game.ClientboundSetTitlesAnimationPacket(
+                            fadeInTicks, stayTicks, fadeOutTicks)));
+            this.channel.write(new PlaybackPacket(
+                    new net.minecraft.network.protocol.game.ClientboundSetSubtitleTextPacket(empty)));
+            this.channel.writeAndFlush(new PlaybackPacket(
+                    new net.minecraft.network.protocol.game.ClientboundSetTitleTextPacket(nms)));
         } catch (Throwable t) {
             this.plugin.getLogger().fine("Fade-to-black failed: " + t);
         }
@@ -369,9 +374,9 @@ public class PlaybackSession {
             if (this.task != null) { this.task.cancel(); this.task = null; }
             if (this.plan != null && !this.plan.isLast(this.segmentIndex)) {
                 // Black fade covers the inter-segment hand-off (entity unwind +
-                // chunk forget + new snapshot dispatch). 200ms fade-in, 600ms
-                // hold, 200ms fade-out. Advance fires once we're fully black.
-                sendBlackFade(200, 600, 200);
+                // chunk forget + new snapshot dispatch). 4t fade-in, 12t hold,
+                // 4t fade-out. Advance fires once we're fully black.
+                sendBlackFade(4, 12, 4);
                 Bukkit.getScheduler().runTaskLater(this.plugin, this::advanceToNextSegment, 4L);
             } else {
                 finish("Trailer complete");
