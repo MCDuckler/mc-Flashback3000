@@ -392,13 +392,13 @@ public class PlaybackSession {
                 // Defensive: a recorded SetEntityData may carry field indices that
                 // exceed the receiving entity's data-array length when the recording
                 // came from a ModelEngine-augmented server (extra custom fields) or
-                // when the server reused an entity id and the recording's mid-stream
-                // updates target a different entity type than the snapshot's
-                // AddEntity. Either way the vanilla client throws AIOOBE during
-                // bundle apply -> kick. Drop only the offending packet (high field
-                // indices), keep low-index ones so vanilla animations still flow.
+                // when the server reused an entity id. Vanilla client throws AIOOBE
+                // during bundle apply -> kick. Drop only the offending packet (high
+                // field indices), keep low-index ones so animations still flow. Done
+                // for BOTH snapshot and mid-stream phases - the snapshot emits one
+                // SetEntityData per cached entity and ModelEngine entities have
+                // baked-in high field indices in the cache.
                 if (this.plan != null
-                        && !this.dispatchingSnapshot
                         && packet instanceof ClientboundSetEntityDataPacket sed
                         && hasOutOfBoundsField(sed)) {
                     if (this.droppedClassesSeen.add("SetEntityData[oob]")) {
