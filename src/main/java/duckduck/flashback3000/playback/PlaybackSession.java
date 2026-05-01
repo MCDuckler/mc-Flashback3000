@@ -127,6 +127,11 @@ public class PlaybackSession {
     // off the player at start so their HUD chrome doesn't clutter the cinematic,
     // and reattach at end so post-trailer play resumes with the same bars.
     private final java.util.List<org.bukkit.boss.KeyedBossBar> savedBossBars = new java.util.ArrayList<>();
+    // ServerBossEvent instances we removed the viewer from at scene start.
+    // We re-add them in restoreViewerBossBars so the real server resumes
+    // sending UPDATEs to this viewer. Without this, BossEventPacket UPDATEs
+    // for unknown UUIDs reach the client post-RESTORE -> BossBarHud NPE -> kick.
+    private final java.util.List<net.minecraft.server.level.ServerBossEvent> savedServerBossEvents = new java.util.ArrayList<>();
 
     // Per-segment client state we've installed so we can tear it down at the
     // segment boundary without a full Respawn (and thus without the vanilla
@@ -360,25 +365,25 @@ public class PlaybackSession {
     }
 
     private void clearViewerBossBars() {
-        // Two sources of pre-existing bars: Bukkit KeyedBossBar (showable to
-        // a Player via addPlayer) and Adventure BossBar (player.showBossBar).
-        // The KeyedBossBar path needs to fire BEFORE the filter goes active,
-        // since removePlayer routes through the real-server path. Filter is
-        // already active by the time this is called, so we send the actual
-        // ClientboundBossEventPacket REMOVE wrapped in PlaybackPacket so it
-        // bypasses the filter — works for both kinds.
-        java.util.Set<java.util.UUID> ids = new java.util.HashSet<>();
+        // Pull every ServerBossEvent the viewer is currently registered on,
+        // both Bukkit KeyedBossBar (Bukkit.getBossBars()) and Adventure
+        // BossBar (CraftPlayer.activeBossBars()). For each: remove the viewer
+        // from ServerBossEvent.players. That stops the real server from
+        // emitting UPDATE_NAME / UPDATE_PROGRESS packets to this viewer for
+        // bars whose UUID the client has forgotten — a single such UPDATE
+        // post-RESTORE is enough to NPE BossBarHud.update on the client.
+        // The per-bar REMOVE packet to the client (so the bar disappears
+        // visually now) goes through PlaybackPacket so the active filter
+        // doesn't drop it.
+        java.util.Set<net.minecraft.server.level.ServerBossEvent> targets = new java.util.HashSet<>();
         try {
             var iter = org.bukkit.Bukkit.getBossBars();
             while (iter.hasNext()) {
                 org.bukkit.boss.KeyedBossBar bar = iter.next();
                 if (bar.getPlayers().contains(this.bukkitPlayer)) {
                     this.savedBossBars.add(bar);
-                    // KeyedBossBar -> CraftBossBar wraps a ServerBossEvent whose
-                    // getId() is the wire UUID. Pull it via reflection to keep
-                    // this code compatible across CraftBukkit refactors.
-                    java.util.UUID id = extractKeyedBossBarUuid(bar);
-                    if (id != null) ids.add(id);
+                    var sbe = extractServerBossEvent(bar.getClass(), bar, "handle");
+                    if (sbe != null) targets.add(sbe);
                 }
             }
         } catch (Throwable t) {
@@ -386,45 +391,55 @@ public class PlaybackSession {
         }
         try {
             for (var advBar : this.bukkitPlayer.activeBossBars()) {
-                java.util.UUID id = extractAdventureBossBarUuid(advBar);
-                if (id != null) ids.add(id);
+                var impl = net.kyori.adventure.bossbar.BossBarImplementation.get(advBar,
+                        io.papermc.paper.adventure.BossBarImplementationImpl.class);
+                var sbe = extractServerBossEvent(impl.getClass(), impl, "vanilla");
+                if (sbe != null) targets.add(sbe);
             }
         } catch (Throwable t) {
             this.plugin.getLogger().warning("Failed to enumerate Adventure boss bars: " + t);
         }
-        for (java.util.UUID id : ids) {
+        for (var sbe : targets) {
             try {
+                // Send REMOVE to client first (visible cleanup) — the real
+                // server's removePlayer would also send REMOVE but the active
+                // filter would block it. PlaybackPacket bypasses the filter.
                 this.channel.write(new PlaybackPacket(
-                        net.minecraft.network.protocol.game.ClientboundBossEventPacket.createRemovePacket(id)));
+                        net.minecraft.network.protocol.game.ClientboundBossEventPacket.createRemovePacket(sbe.getId())));
+                // Then drop the viewer from the server-side tracking set so
+                // future broadcasts skip them.
+                sbe.removePlayer(this.serverPlayer);
+                this.savedServerBossEvents.add(sbe);
             } catch (Throwable ignored) {}
         }
         this.channel.flush();
     }
 
-    private static java.util.@org.jspecify.annotations.Nullable UUID extractKeyedBossBarUuid(org.bukkit.boss.KeyedBossBar bar) {
+    private static net.minecraft.server.level.@org.jspecify.annotations.Nullable ServerBossEvent extractServerBossEvent(
+            Class<?> clazz, Object instance, String field) {
         try {
-            // CraftBossBar.handle is the underlying ServerBossEvent
-            java.lang.reflect.Field f = bar.getClass().getDeclaredField("handle");
+            java.lang.reflect.Field f = clazz.getDeclaredField(field);
             f.setAccessible(true);
-            Object handle = f.get(bar);
-            if (handle instanceof net.minecraft.world.BossEvent be) return be.getId();
-        } catch (Throwable ignored) {}
-        return null;
-    }
-
-    private static java.util.@org.jspecify.annotations.Nullable UUID extractAdventureBossBarUuid(net.kyori.adventure.bossbar.BossBar bar) {
-        try {
-            var impl = net.kyori.adventure.bossbar.BossBarImplementation.get(bar,
-                    io.papermc.paper.adventure.BossBarImplementationImpl.class);
-            java.lang.reflect.Field f = impl.getClass().getDeclaredField("vanilla");
-            f.setAccessible(true);
-            Object handle = f.get(impl);
-            if (handle instanceof net.minecraft.world.BossEvent be) return be.getId();
+            Object handle = f.get(instance);
+            if (handle instanceof net.minecraft.server.level.ServerBossEvent sbe) return sbe;
         } catch (Throwable ignored) {}
         return null;
     }
 
     private void restoreViewerBossBars() {
+        // Re-attach the viewer to every ServerBossEvent we removed them from.
+        // addPlayer fires an ADD packet through the real-server path; the
+        // filter is inactive (or about to be) by the time this runs in finish(),
+        // so the client sees the bar reappear with the latest server state.
+        for (var sbe : this.savedServerBossEvents) {
+            try { sbe.addPlayer(this.serverPlayer); } catch (Throwable ignored) {}
+        }
+        this.savedServerBossEvents.clear();
+        // KeyedBossBar.addPlayer is a no-op if the underlying ServerBossEvent
+        // already contains the player (which happens because we just re-added
+        // through the SBE above), but we still walk the saved list so callers
+        // observing player.getActiveBossBars() see them in the post-restore
+        // snapshot consistent with where they came from.
         for (org.bukkit.boss.KeyedBossBar bar : this.savedBossBars) {
             try { bar.addPlayer(this.bukkitPlayer); } catch (Throwable ignored) {}
         }
