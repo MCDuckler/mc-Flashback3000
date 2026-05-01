@@ -2,7 +2,7 @@ package duckduck.flashback3000.protocol;
 
 public final class PacketIds {
 
-    public static final int PROTOCOL_VERSION = 1;
+    public static final int PROTOCOL_VERSION = 2;
 
     public static final String CHANNEL = "flashback3000:control";
     public static final String CHANNEL_NAMESPACE = "flashback3000";
@@ -28,10 +28,29 @@ public final class PacketIds {
     public static final byte DOWNLOAD_ACK = 0x43;
     public static final byte DOWNLOAD_END = 0x44;
 
+    public static final byte UPLOAD_SCENES_START = 0x50;
+    public static final byte UPLOAD_SCENES_CHUNK = 0x51;
+    public static final byte UPLOAD_SCENES_ACK = 0x52;
+    public static final byte UPLOAD_SCENES_END = 0x53;
+    public static final byte UPLOAD_SCENES_RESULT = 0x54;
+    public static final byte LIST_SCENES = 0x55;
+    public static final byte SCENE_LIST = 0x56;
+
+    public static final byte PLAY_SCENE_REQUEST = 0x60;
+    public static final byte CANCEL_PLAYBACK = 0x61;
+    public static final byte PLAYBACK_STATUS = 0x62;
+
+    public static final byte END_RESTORE = 0x00;
+    public static final byte END_KICK    = 0x01;
+
     public static final byte PERM_ADMIN = 0x01;
 
     public static final int DOWNLOAD_CHUNK_SIZE = 32 * 1024;
     public static final int DOWNLOAD_WINDOW = 16;
+
+    public static final int UPLOAD_CHUNK_SIZE = 32 * 1024;
+    public static final int UPLOAD_WINDOW = 16;
+    public static final int UPLOAD_MAX_BYTES = 4 * 1024 * 1024;
 
     private PacketIds() {}
 }

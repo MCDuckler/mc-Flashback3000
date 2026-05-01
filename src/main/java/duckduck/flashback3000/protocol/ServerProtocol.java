@@ -2,7 +2,11 @@ package duckduck.flashback3000.protocol;
 
 import duckduck.flashback3000.Flashback3000;
 import duckduck.flashback3000.RecordingManager;
+import duckduck.flashback3000.api.EndBehavior;
+import duckduck.flashback3000.api.ScenePlaybackOptions;
 import duckduck.flashback3000.record.Recorder;
+import duckduck.flashback3000.scene.ParsedScenes;
+import duckduck.flashback3000.scene.SceneStore;
 import org.bukkit.Bukkit;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
@@ -28,17 +32,20 @@ public class ServerProtocol implements PluginMessageListener, Listener {
 
     private final Flashback3000 plugin;
     private final ReplayLibrary library;
+    private final SceneStore sceneStore;
     private final Map<UUID, DownloadSession> downloads = new ConcurrentHashMap<>();
     private final Map<UUID, ScheduledFuture<?>> pumpTasks = new ConcurrentHashMap<>();
+    private final Map<UUID, UploadSession> uploads = new ConcurrentHashMap<>();
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "Flashback3000-DownloadPump");
         t.setDaemon(true);
         return t;
     });
 
-    public ServerProtocol(Flashback3000 plugin) {
+    public ServerProtocol(Flashback3000 plugin, SceneStore sceneStore) {
         this.plugin = plugin;
         this.library = new ReplayLibrary(plugin.getRecordingManager().outputRoot());
+        this.sceneStore = sceneStore;
     }
 
     public ReplayLibrary library() {
@@ -66,6 +73,8 @@ public class ServerProtocol implements PluginMessageListener, Listener {
         this.downloads.clear();
         this.pumpTasks.values().forEach(f -> f.cancel(false));
         this.pumpTasks.clear();
+        for (UploadSession us : this.uploads.values()) us.close();
+        this.uploads.clear();
         this.scheduler.shutdownNow();
     }
 
@@ -91,6 +100,12 @@ public class ServerProtocol implements PluginMessageListener, Listener {
             case PacketIds.DELETE_REPLAY -> handleDelete(player, Wire.readUUID(in));
             case PacketIds.DOWNLOAD_REQUEST -> handleDownloadRequest(player, Wire.readUUID(in));
             case PacketIds.DOWNLOAD_ACK -> handleDownloadAck(player, Wire.readUUID(in), in.readInt());
+            case PacketIds.UPLOAD_SCENES_START -> handleUploadStart(player, Wire.readUUID(in), in.readLong(), in.readInt());
+            case PacketIds.UPLOAD_SCENES_CHUNK -> handleUploadChunk(player, Wire.readUUID(in), in.readInt(), Wire.readBytes(in));
+            case PacketIds.UPLOAD_SCENES_END -> handleUploadEnd(player, Wire.readUUID(in));
+            case PacketIds.LIST_SCENES -> handleListScenes(player, Wire.readUUID(in));
+            case PacketIds.PLAY_SCENE_REQUEST -> handlePlayScene(player, Wire.readUUID(in), in.readUTF(), in.readByte());
+            case PacketIds.CANCEL_PLAYBACK -> handleCancelPlayback(player);
             default -> this.plugin.getLogger().warning("Unknown opcode 0x" + Integer.toHexString(op & 0xFF));
         }
     }
@@ -332,11 +347,170 @@ public class ServerProtocol implements PluginMessageListener, Listener {
         }));
     }
 
+    // -------- scene upload --------
+
+    private void handleUploadStart(Player player, UUID replayId, long totalSize, int chunkCount) {
+        if (!checkAdmin(player)) return;
+        if (totalSize < 0 || totalSize > PacketIds.UPLOAD_MAX_BYTES) {
+            sendUploadResult(player, replayId, false, "Upload too large", 0);
+            return;
+        }
+        if (chunkCount <= 0) {
+            sendUploadResult(player, replayId, false, "Empty upload", 0);
+            return;
+        }
+        try {
+            if (this.library.findById(replayId) == null) {
+                sendUploadResult(player, replayId, false, "Replay not found on server", 0);
+                return;
+            }
+        } catch (IOException e) {
+            sendUploadResult(player, replayId, false, "Library scan failed: " + e.getMessage(), 0);
+            return;
+        }
+        UploadSession existing = this.uploads.remove(player.getUniqueId());
+        if (existing != null) existing.close();
+        this.uploads.put(player.getUniqueId(), new UploadSession(replayId, totalSize, chunkCount));
+    }
+
+    private void handleUploadChunk(Player player, UUID replayId, int chunkIndex, byte[] data) {
+        UploadSession session = this.uploads.get(player.getUniqueId());
+        if (session == null || !session.replayId().equals(replayId)) return;
+        if (session.receivedBytes() + data.length > PacketIds.UPLOAD_MAX_BYTES) {
+            this.uploads.remove(player.getUniqueId());
+            session.close();
+            sendUploadResult(player, replayId, false, "Upload exceeded size cap", 0);
+            return;
+        }
+        if (session.acceptChunk(chunkIndex, data)) {
+            send(player, Wire.build(PacketIds.UPLOAD_SCENES_ACK, out -> {
+                try {
+                    Wire.writeUUID(out, replayId);
+                    out.writeInt(chunkIndex);
+                } catch (IOException ignored) {}
+            }));
+        }
+    }
+
+    private void handleUploadEnd(Player player, UUID replayId) {
+        UploadSession session = this.uploads.remove(player.getUniqueId());
+        if (session == null) {
+            sendUploadResult(player, replayId, false, "No active upload", 0);
+            return;
+        }
+        try {
+            if (!session.isComplete()) {
+                sendUploadResult(player, replayId, false, "Upload incomplete", 0);
+                return;
+            }
+            byte[] payload = session.assemble();
+            ParsedScenes parsed;
+            try {
+                parsed = ParsedScenes.parse(payload);
+            } catch (Exception e) {
+                sendUploadResult(player, replayId, false, "Invalid JSON: " + e.getMessage(), 0);
+                return;
+            }
+            if (!parsed.replayUuid().equals(replayId)) {
+                sendUploadResult(player, replayId, false, "replayUuid mismatch", 0);
+                return;
+            }
+            for (ParsedScenes.Scene scene : parsed.scenes()) {
+                if (!scene.isWellFormed()) {
+                    sendUploadResult(player, replayId, false,
+                            "Scene " + scene.id() + " malformed (samples=" + scene.samples().size()
+                                    + ", expected=" + scene.expectedSampleCount() + ")", 0);
+                    return;
+                }
+            }
+            try {
+                this.sceneStore.save(replayId, payload);
+            } catch (IOException e) {
+                sendUploadResult(player, replayId, false, "Save failed: " + e.getMessage(), 0);
+                return;
+            }
+            sendUploadResult(player, replayId, true, "Saved " + parsed.scenes().size() + " scene(s)", parsed.scenes().size());
+            sendSceneList(player, replayId);
+        } finally {
+            session.close();
+        }
+    }
+
+    private void handleListScenes(Player player, UUID replayId) {
+        if (!checkAdmin(player)) return;
+        sendSceneList(player, replayId);
+    }
+
+    private void sendSceneList(Player player, UUID replayId) {
+        List<ParsedScenes.Summary> summaries = this.sceneStore.list(replayId);
+        send(player, Wire.build(PacketIds.SCENE_LIST, out -> {
+            try {
+                Wire.writeUUID(out, replayId);
+                out.writeInt(summaries.size());
+                for (ParsedScenes.Summary s : summaries) {
+                    out.writeUTF(s.id());
+                    out.writeUTF(s.name());
+                    out.writeInt(s.startTick());
+                    out.writeInt(s.endTick());
+                    out.writeInt(s.sampleCount());
+                }
+            } catch (IOException ignored) {}
+        }));
+    }
+
+    private void sendUploadResult(Player player, UUID replayId, boolean ok, String msg, int sceneCount) {
+        send(player, Wire.build(PacketIds.UPLOAD_SCENES_RESULT, out -> {
+            try {
+                Wire.writeUUID(out, replayId);
+                out.writeBoolean(ok);
+                out.writeUTF(msg == null ? "" : msg);
+                out.writeInt(sceneCount);
+            } catch (IOException ignored) {}
+        }));
+    }
+
+    // -------- scene playback (mod-triggered) --------
+
+    private void handlePlayScene(Player player, UUID replayId, String sceneId, byte endByte) {
+        if (!checkAdmin(player)) return;
+        EndBehavior end = endByte == PacketIds.END_KICK ? EndBehavior.KICK : EndBehavior.RESTORE;
+        ScenePlaybackOptions opts = new ScenePlaybackOptions(end, true);
+        Bukkit.getScheduler().runTask(this.plugin, () -> {
+            try {
+                this.plugin.getPlaybackManager().startScene(player, replayId, sceneId, opts);
+                sendPlaybackStatus(player, true, replayId, sceneId, "Playback started");
+            } catch (Exception e) {
+                sendPlaybackStatus(player, false, replayId, sceneId, e.getMessage());
+            }
+        });
+    }
+
+    private void handleCancelPlayback(Player player) {
+        if (!checkAdmin(player)) return;
+        Bukkit.getScheduler().runTask(this.plugin, () -> {
+            this.plugin.getPlaybackManager().cancel(player);
+            sendPlaybackStatus(player, false, new UUID(0L, 0L), "", "Cancelled");
+        });
+    }
+
+    public void sendPlaybackStatus(Player player, boolean active, UUID replayId, String sceneId, String msg) {
+        send(player, Wire.build(PacketIds.PLAYBACK_STATUS, out -> {
+            try {
+                out.writeBoolean(active);
+                Wire.writeUUID(out, replayId);
+                out.writeUTF(sceneId == null ? "" : sceneId);
+                out.writeUTF(msg == null ? "" : msg);
+            } catch (IOException ignored) {}
+        }));
+    }
+
     @EventHandler
     public void onQuit(PlayerQuitEvent event) {
         DownloadSession ds = this.downloads.remove(event.getPlayer().getUniqueId());
         if (ds != null) ds.close();
         ScheduledFuture<?> task = this.pumpTasks.remove(event.getPlayer().getUniqueId());
         if (task != null) task.cancel(false);
+        UploadSession us = this.uploads.remove(event.getPlayer().getUniqueId());
+        if (us != null) us.close();
     }
 }

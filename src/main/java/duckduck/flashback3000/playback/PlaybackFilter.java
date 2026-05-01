@@ -1,8 +1,10 @@
 package duckduck.flashback3000.playback;
 
+import duckduck.flashback3000.protocol.PacketIds;
 import io.netty.channel.ChannelDuplexHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelPromise;
+import net.minecraft.network.protocol.common.ServerboundCustomPayloadPacket;
 import net.minecraft.network.protocol.common.ServerboundKeepAlivePacket;
 import net.minecraft.network.protocol.common.ServerboundPongPacket;
 
@@ -37,10 +39,20 @@ public class PlaybackFilter extends ChannelDuplexHandler {
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
         if (this.active) {
-            // Allow keep-alive / pong so the connection stays open. Drop everything else.
+            // Allow keep-alive / pong so the connection stays open. Drop everything else
+            // except plugin messages on our control channel — those carry mid-playback
+            // commands like CANCEL_PLAYBACK that must reach the server.
             if (msg instanceof ServerboundKeepAlivePacket || msg instanceof ServerboundPongPacket) {
                 ctx.fireChannelRead(msg);
                 return;
+            }
+            if (msg instanceof ServerboundCustomPayloadPacket pkt) {
+                var id = pkt.payload().type().id();
+                if (id.getNamespace().equals(PacketIds.CHANNEL_NAMESPACE)
+                        && id.getPath().equals("control")) {
+                    ctx.fireChannelRead(msg);
+                    return;
+                }
             }
             return;
         }

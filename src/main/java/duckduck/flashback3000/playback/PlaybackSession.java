@@ -1,6 +1,8 @@
 package duckduck.flashback3000.playback;
 
 import duckduck.flashback3000.Flashback3000;
+import duckduck.flashback3000.api.EndBehavior;
+import duckduck.flashback3000.scene.ParsedScenes;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
@@ -12,12 +14,14 @@ import net.minecraft.network.codec.StreamCodec;
 import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.game.ClientGamePacketListener;
 import net.minecraft.network.protocol.game.ClientboundEntityPositionSyncPacket;
+import net.minecraft.network.protocol.game.ClientboundPlayerPositionPacket;
 import net.minecraft.network.protocol.game.ClientboundRotateHeadPacket;
 import net.minecraft.network.protocol.game.GameProtocols;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.network.ServerCommonPacketListenerImpl;
 import net.minecraft.world.entity.PositionMoveRotation;
+import net.minecraft.world.entity.Relative;
 import net.minecraft.world.phys.Vec3;
 import org.bukkit.Bukkit;
 import org.bukkit.craftbukkit.entity.CraftPlayer;
@@ -26,6 +30,7 @@ import org.bukkit.scheduler.BukkitTask;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.List;
+import java.util.Set;
 
 public class PlaybackSession {
 
@@ -45,15 +50,24 @@ public class PlaybackSession {
     private final RegistryAccess registryAccess;
     private final StreamCodec<ByteBuf, Packet<? super ClientGamePacketListener>> gamePacketCodec;
     private final PlaybackFilter filter;
+    private final @Nullable ScenePlan plan;
+    private final @Nullable Runnable onFinish;
 
     private int chunkIndex = 0;
     private @Nullable ReplayFile.ParsedChunk currentChunk;
     private int tickInChunk = 0;
+    private int globalTick = 0;
+    private int teleportSeq = 0;
     private boolean snapshotSent = false;
     private boolean finished = false;
     private @Nullable BukkitTask task;
 
     public PlaybackSession(Flashback3000 plugin, Player bukkitPlayer, ReplayFile replay) {
+        this(plugin, bukkitPlayer, replay, null, null);
+    }
+
+    public PlaybackSession(Flashback3000 plugin, Player bukkitPlayer, ReplayFile replay,
+                           @Nullable ScenePlan plan, @Nullable Runnable onFinish) {
         this.plugin = plugin;
         this.bukkitPlayer = bukkitPlayer;
         this.serverPlayer = ((CraftPlayer) bukkitPlayer).getHandle();
@@ -63,11 +77,15 @@ public class PlaybackSession {
         this.gamePacketCodec = GameProtocols.CLIENTBOUND_TEMPLATE
                 .bind(RegistryFriendlyByteBuf.decorator(this.registryAccess)).codec();
         this.filter = new PlaybackFilter();
+        this.plan = plan;
+        this.onFinish = onFinish;
     }
 
     public Player player() {
         return this.bukkitPlayer;
     }
+
+    private static final int SKIP_TICKS_PER_PASS = 200;
 
     public void start() {
         this.channel.eventLoop().execute(() -> {
@@ -89,6 +107,49 @@ public class PlaybackSession {
                 this.finish("Snapshot dispatch failed");
                 return;
             }
+            if (this.plan != null && this.plan.startTick() > 0) {
+                runSkipAheadPass();
+            } else {
+                scheduleTickTimer();
+            }
+        });
+    }
+
+    /**
+     * Sliced skip-ahead: dispatch up to SKIP_TICKS_PER_PASS ticks then yield the
+     * netty event loop. Reschedules itself until {@code globalTick} reaches
+     * {@code plan.startTick()}, then hands off to the Bukkit per-tick task.
+     */
+    private void runSkipAheadPass() {
+        if (this.finished) return;
+        int target = this.plan.startTick();
+        try {
+            int pass = 0;
+            while (this.globalTick < target && pass < SKIP_TICKS_PER_PASS) {
+                if (this.tickInChunk >= this.currentChunk.ticks().size()) {
+                    advanceChunk();
+                    if (this.finished) return;
+                    continue;
+                }
+                dispatchTick(false);
+                pass++;
+            }
+        } catch (Throwable t) {
+            this.plugin.getLogger().severe("Skip-ahead failed: " + t);
+            this.finish("Skip-ahead failed");
+            return;
+        }
+        if (this.finished) return;
+        if (this.globalTick < target) {
+            this.channel.eventLoop().execute(this::runSkipAheadPass);
+        } else {
+            scheduleTickTimer();
+        }
+    }
+
+    private void scheduleTickTimer() {
+        Bukkit.getScheduler().runTask(this.plugin, () -> {
+            if (this.finished) return;
             this.task = Bukkit.getScheduler().runTaskTimer(this.plugin, this::tick, 1L, 1L);
         });
     }
@@ -101,26 +162,50 @@ public class PlaybackSession {
 
     private void tick() {
         if (this.finished) return;
+        if (this.plan != null && this.globalTick > this.plan.endTick()) {
+            finish("Scene complete");
+            return;
+        }
         try {
             if (this.tickInChunk >= this.currentChunk.ticks().size()) {
                 advanceChunk();
                 if (this.finished) return;
             }
-            List<RawAction> tickActions = this.currentChunk.ticks().get(this.tickInChunk);
-            this.tickInChunk++;
-            for (RawAction action : tickActions) {
-                dispatch(action);
-            }
+            dispatchTick(true);
         } catch (Throwable t) {
             this.plugin.getLogger().severe("Playback tick failed: " + t);
             this.finish("Playback error");
         }
     }
 
+    private void dispatchTick(boolean applyCameraOverride) {
+        List<RawAction> tickActions = this.currentChunk.ticks().get(this.tickInChunk);
+        this.tickInChunk++;
+        for (RawAction action : tickActions) {
+            dispatch(action);
+        }
+        if (applyCameraOverride && this.plan != null && this.plan.overrideCamera()) {
+            ParsedScenes.CameraSample sample = this.plan.sampleAt(this.globalTick);
+            if (sample != null) sendCameraOverride(sample);
+        }
+        this.globalTick++;
+    }
+
+    private void sendCameraOverride(ParsedScenes.CameraSample sample) {
+        PositionMoveRotation pmr = new PositionMoveRotation(
+                new Vec3(sample.x(), sample.y(), sample.z()),
+                Vec3.ZERO,
+                sample.yaw(),
+                sample.pitch());
+        ClientboundPlayerPositionPacket pkt = new ClientboundPlayerPositionPacket(
+                ++this.teleportSeq, pmr, Set.<Relative>of());
+        send(pkt);
+    }
+
     private void advanceChunk() {
         this.chunkIndex++;
         if (this.chunkIndex >= this.replay.chunkOrder().size()) {
-            this.finish("Trailer complete");
+            this.finish(this.plan != null ? "Scene complete" : "Trailer complete");
             return;
         }
         try {
@@ -139,6 +224,10 @@ public class PlaybackSession {
         try {
             if (type.equals(GAME_PACKET)) {
                 Packet<? super ClientGamePacketListener> packet = decodeGame(action.payload());
+                if (this.plan != null && this.plan.overrideCamera()
+                        && packet instanceof ClientboundPlayerPositionPacket) {
+                    return;
+                }
                 send(packet);
             } else if (type.equals(LEVEL_CHUNK_CACHED)) {
                 FriendlyByteBuf buf = wrap(action.payload());
@@ -218,16 +307,28 @@ public class PlaybackSession {
         }
         try { this.replay.close(); } catch (Exception ignored) {}
 
-        // Disable filter so subsequent traffic flows normally, then kick the player so a fresh
-        // join rebuilds their actual world view. Crude but reliable.
+        EndBehavior end = this.plan != null ? this.plan.endBehavior() : EndBehavior.KICK;
         this.filter.setActive(false);
-        Bukkit.getScheduler().runTask(this.plugin, () -> {
-            try {
-                this.bukkitPlayer.kick(Component.text(reason + " — please reconnect"));
-            } catch (Exception ignored) {}
-        });
 
-        // Remove filter handler from pipeline (safe even after kick).
+        if (end == EndBehavior.KICK) {
+            Bukkit.getScheduler().runTask(this.plugin, () -> {
+                try {
+                    this.bukkitPlayer.kick(Component.text(reason + " — please reconnect"));
+                } catch (Exception ignored) {}
+            });
+        } else {
+            Bukkit.getScheduler().runTask(this.plugin, () -> {
+                try {
+                    PlayerStateRestore.restore(this.serverPlayer);
+                } catch (Throwable t) {
+                    this.plugin.getLogger().warning("Restore failed for " + this.bukkitPlayer.getName() + ": " + t);
+                    try {
+                        this.bukkitPlayer.kick(Component.text("Playback ended; please reconnect"));
+                    } catch (Exception ignored) {}
+                }
+            });
+        }
+
         this.channel.eventLoop().execute(() -> {
             try {
                 if (this.channel.pipeline().get(PlaybackFilter.NAME) != null) {
@@ -235,5 +336,9 @@ public class PlaybackSession {
                 }
             } catch (Throwable ignored) {}
         });
+
+        if (this.onFinish != null) {
+            try { this.onFinish.run(); } catch (Throwable ignored) {}
+        }
     }
 }

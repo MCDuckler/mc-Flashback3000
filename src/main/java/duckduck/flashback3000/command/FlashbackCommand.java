@@ -2,7 +2,10 @@ package duckduck.flashback3000.command;
 
 import duckduck.flashback3000.Flashback3000;
 import duckduck.flashback3000.RecordingManager;
+import duckduck.flashback3000.api.EndBehavior;
+import duckduck.flashback3000.api.ScenePlaybackOptions;
 import duckduck.flashback3000.record.Recorder;
+import duckduck.flashback3000.scene.ParsedScenes;
 import org.bukkit.Bukkit;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
@@ -32,7 +35,7 @@ public class FlashbackCommand implements CommandExecutor, TabCompleter {
     public boolean onCommand(@NotNull CommandSender sender, @NotNull Command command,
                              @NotNull String label, @NotNull String[] args) {
         if (args.length == 0) {
-            sender.sendMessage("Usage: /flashback <start|stop|cancel|list|files|play|playstop> [...]");
+            sender.sendMessage("Usage: /flashback <start|stop|cancel|list|files|play|playscene|playstop|scenes> [...]");
             return true;
         }
         String sub = args[0].toLowerCase();
@@ -43,12 +46,82 @@ public class FlashbackCommand implements CommandExecutor, TabCompleter {
             case "list" -> handleList(sender);
             case "files" -> handleFiles(sender);
             case "play" -> handlePlay(sender, args);
+            case "playscene" -> handlePlayScene(sender, args);
             case "playstop" -> handlePlayStop(sender, args);
+            case "scenes" -> handleScenes(sender, args);
             default -> {
                 sender.sendMessage("Unknown subcommand: " + sub);
                 yield true;
             }
         };
+    }
+
+    private boolean handlePlayScene(CommandSender sender, String[] args) {
+        if (args.length < 3) {
+            sender.sendMessage("Usage: /flashback playscene <replay-uuid> <scene-id> [player] [--kick|--restore]");
+            return true;
+        }
+        UUID replayId;
+        try {
+            replayId = UUID.fromString(args[1]);
+        } catch (IllegalArgumentException e) {
+            sender.sendMessage("First argument must be a replay UUID. Use /flashback scenes list to find one.");
+            return true;
+        }
+        String sceneId = args[2];
+        EndBehavior end = EndBehavior.RESTORE;
+        Player target = null;
+        for (int i = 3; i < args.length; i++) {
+            String a = args[i];
+            if (a.equalsIgnoreCase("--kick")) {
+                end = EndBehavior.KICK;
+            } else if (a.equalsIgnoreCase("--restore")) {
+                end = EndBehavior.RESTORE;
+            } else if (target == null) {
+                target = Bukkit.getPlayerExact(a);
+                if (target == null) {
+                    sender.sendMessage("Unknown player: " + a);
+                    return true;
+                }
+            }
+        }
+        if (target == null && sender instanceof Player p) target = p;
+        if (target == null) {
+            sender.sendMessage("Specify a target player.");
+            return true;
+        }
+        ScenePlaybackOptions opts = new ScenePlaybackOptions(end, true);
+        try {
+            this.plugin.getPlaybackManager().startScene(target, replayId, sceneId, opts);
+            sender.sendMessage("Started scene " + sceneId + " for " + target.getName() + " (end=" + end + ")");
+        } catch (Exception e) {
+            sender.sendMessage("Failed to play scene: " + e.getMessage());
+        }
+        return true;
+    }
+
+    private boolean handleScenes(CommandSender sender, String[] args) {
+        if (args.length < 2) {
+            sender.sendMessage("Usage: /flashback scenes <replay-uuid>");
+            return true;
+        }
+        UUID replayId;
+        try {
+            replayId = UUID.fromString(args[1]);
+        } catch (IllegalArgumentException e) {
+            sender.sendMessage("Replay UUID required.");
+            return true;
+        }
+        ParsedScenes parsed = this.plugin.getSceneStore().load(replayId);
+        if (parsed == null) {
+            sender.sendMessage("No scenes uploaded for " + replayId);
+            return true;
+        }
+        sender.sendMessage("Scenes for " + replayId + ":");
+        for (ParsedScenes.Summary s : parsed.summaries()) {
+            sender.sendMessage(" - " + s.id() + " \"" + s.name() + "\" ticks=[" + s.startTick() + ".." + s.endTick() + "] samples=" + s.sampleCount());
+        }
+        return true;
     }
 
     private boolean handlePlay(CommandSender sender, String[] args) {
@@ -184,7 +257,7 @@ public class FlashbackCommand implements CommandExecutor, TabCompleter {
     public List<String> onTabComplete(@NotNull CommandSender sender, @NotNull Command command,
                                       @NotNull String alias, @NotNull String[] args) {
         if (args.length == 1) {
-            List<String> subs = new ArrayList<>(List.of("start", "stop", "cancel", "list", "files", "play", "playstop"));
+            List<String> subs = new ArrayList<>(List.of("start", "stop", "cancel", "list", "files", "play", "playscene", "playstop", "scenes"));
             subs.removeIf(s -> !s.startsWith(args[0].toLowerCase()));
             return subs;
         }
@@ -196,6 +269,39 @@ public class FlashbackCommand implements CommandExecutor, TabCompleter {
                 if (p.getName().toLowerCase().startsWith(args[1].toLowerCase())) names.add(p.getName());
             }
             return names;
+        }
+        if (args.length == 2 && (args[0].equalsIgnoreCase("playscene")
+                || args[0].equalsIgnoreCase("scenes"))) {
+            List<String> ids = new ArrayList<>();
+            try {
+                this.plugin.getServerProtocol().library().list().forEach(e -> ids.add(e.uuid().toString()));
+            } catch (IOException ignored) {}
+            ids.removeIf(s -> !s.startsWith(args[1]));
+            return ids;
+        }
+        if (args.length == 3 && args[0].equalsIgnoreCase("playscene")) {
+            List<String> ids = new ArrayList<>();
+            try {
+                UUID replayId = UUID.fromString(args[1]);
+                ParsedScenes parsed = this.plugin.getSceneStore().load(replayId);
+                if (parsed != null) {
+                    for (ParsedScenes.Summary s : parsed.summaries()) ids.add(s.id());
+                }
+            } catch (IllegalArgumentException ignored) {}
+            ids.removeIf(s -> !s.toLowerCase().startsWith(args[2].toLowerCase()));
+            return ids;
+        }
+        if (args.length == 4 && args[0].equalsIgnoreCase("playscene")) {
+            List<String> names = new ArrayList<>();
+            for (Player p : Bukkit.getOnlinePlayers()) {
+                if (p.getName().toLowerCase().startsWith(args[3].toLowerCase())) names.add(p.getName());
+            }
+            return names;
+        }
+        if (args.length == 5 && args[0].equalsIgnoreCase("playscene")) {
+            List<String> opts = new ArrayList<>(List.of("--restore", "--kick"));
+            opts.removeIf(s -> !s.startsWith(args[4].toLowerCase()));
+            return opts;
         }
         return List.of();
     }

@@ -1,8 +1,14 @@
 package duckduck.flashback3000.playback;
 
 import duckduck.flashback3000.Flashback3000;
+import duckduck.flashback3000.api.ScenePlaybackOptions;
 import duckduck.flashback3000.protocol.ReplayLibrary;
+import duckduck.flashback3000.scene.ParsedScenes;
+import duckduck.flashback3000.scene.SceneStore;
 import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerQuitEvent;
 import org.jetbrains.annotations.Nullable;
 
 import java.io.IOException;
@@ -11,15 +17,17 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
-public class PlaybackManager {
+public class PlaybackManager implements Listener {
 
     private final Flashback3000 plugin;
     private final ReplayLibrary library;
+    private final SceneStore sceneStore;
     private final Map<UUID, PlaybackSession> active = new ConcurrentHashMap<>();
 
-    public PlaybackManager(Flashback3000 plugin) {
+    public PlaybackManager(Flashback3000 plugin, SceneStore sceneStore) {
         this.plugin = plugin;
         this.library = new ReplayLibrary(plugin.getRecordingManager().outputRoot());
+        this.sceneStore = sceneStore;
     }
 
     public boolean isPlaying(Player player) {
@@ -31,8 +39,35 @@ public class PlaybackManager {
             throw new IllegalStateException("Already playing back for " + player.getName());
         }
         ReplayFile replay = new ReplayFile(replayPath);
-        PlaybackSession session = new PlaybackSession(this.plugin, player, replay);
-        this.active.put(player.getUniqueId(), session);
+        UUID viewerId = player.getUniqueId();
+        PlaybackSession session = new PlaybackSession(this.plugin, player, replay, null,
+                () -> this.active.remove(viewerId));
+        this.active.put(viewerId, session);
+        session.start();
+        return session;
+    }
+
+    public PlaybackSession startScene(Player player, UUID replayId, String sceneId,
+                                      ScenePlaybackOptions opts) throws IOException {
+        if (this.active.containsKey(player.getUniqueId())) {
+            throw new IllegalStateException("Already playing back for " + player.getName());
+        }
+        ReplayLibrary.Entry entry = this.library.findById(replayId);
+        if (entry == null) throw new IOException("Replay not found: " + replayId);
+        ParsedScenes scenes = this.sceneStore.load(replayId);
+        if (scenes == null) throw new IOException("No scenes uploaded for replay " + replayId);
+        ParsedScenes.Scene scene = scenes.findById(sceneId)
+                .orElseThrow(() -> new IOException("Scene not found: " + sceneId));
+        if (!scene.isWellFormed()) {
+            throw new IOException("Scene " + sceneId + " malformed");
+        }
+        ScenePlan plan = new ScenePlan(scene.id(), scene.startTick(), scene.endTick(),
+                scene.samples(), opts.end(), opts.overrideCamera());
+        ReplayFile replay = new ReplayFile(entry.path());
+        UUID viewerId = player.getUniqueId();
+        PlaybackSession session = new PlaybackSession(this.plugin, player, replay, plan,
+                () -> this.active.remove(viewerId));
+        this.active.put(viewerId, session);
         session.start();
         return session;
     }
@@ -66,5 +101,17 @@ public class PlaybackManager {
 
     public ReplayLibrary library() {
         return this.library;
+    }
+
+    public SceneStore sceneStore() {
+        return this.sceneStore;
+    }
+
+    @EventHandler
+    public void onQuit(PlayerQuitEvent event) {
+        PlaybackSession session = this.active.remove(event.getPlayer().getUniqueId());
+        if (session != null) {
+            try { session.finish("Player disconnected"); } catch (Exception ignored) {}
+        }
     }
 }

@@ -1,10 +1,12 @@
 package duckduck.flashback3000;
 
 import duckduck.flashback3000.action.ActionRegistry;
+import duckduck.flashback3000.api.PlaybackApi;
 import duckduck.flashback3000.cache.PacketCacheManager;
 import duckduck.flashback3000.command.FlashbackCommand;
 import duckduck.flashback3000.playback.PlaybackManager;
 import duckduck.flashback3000.protocol.ServerProtocol;
+import duckduck.flashback3000.scene.SceneStore;
 import lombok.Getter;
 import net.minecraft.resources.ResourceLocation;
 import org.bukkit.event.EventHandler;
@@ -34,6 +36,9 @@ public final class Flashback3000 extends JavaPlugin implements Listener {
     @Getter
     private PacketCacheManager packetCacheManager;
 
+    @Getter
+    private SceneStore sceneStore;
+
     @Override
     public void onEnable() {
         instance = this;
@@ -46,9 +51,13 @@ public final class Flashback3000 extends JavaPlugin implements Listener {
         this.packetCacheManager.attachAlreadyOnline();
 
         this.recordingManager = new RecordingManager(this);
-        this.serverProtocol = new ServerProtocol(this);
+        this.sceneStore = new SceneStore(this.recordingManager.outputRoot(), getLogger());
+        this.serverProtocol = new ServerProtocol(this, this.sceneStore);
         this.serverProtocol.register();
-        this.playbackManager = new PlaybackManager(this);
+        this.playbackManager = new PlaybackManager(this, this.sceneStore);
+        getServer().getPluginManager().registerEvents(this.playbackManager, this);
+
+        PlaybackApi.register(this, this.playbackManager, this.sceneStore);
 
         var cmd = getCommand("flashback");
         if (cmd != null) {
@@ -64,6 +73,7 @@ public final class Flashback3000 extends JavaPlugin implements Listener {
 
     @Override
     public void onDisable() {
+        PlaybackApi.unregister();
         if (this.playbackManager != null) this.playbackManager.shutdown();
         if (this.serverProtocol != null) this.serverProtocol.shutdown();
         if (this.recordingManager != null) this.recordingManager.shutdown();
