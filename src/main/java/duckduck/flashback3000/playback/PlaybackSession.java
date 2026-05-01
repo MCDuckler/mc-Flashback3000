@@ -51,6 +51,7 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.network.ServerCommonPacketListenerImpl;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.PositionMoveRotation;
+import net.minecraft.world.entity.Relative;
 import net.minecraft.world.level.GameType;
 import net.minecraft.world.phys.Vec3;
 import org.bukkit.Bukkit;
@@ -257,13 +258,26 @@ public class PlaybackSession {
         ParsedScenes.CameraSample first = this.plan != null && !this.plan.samples().isEmpty()
                 ? this.plan.samples().get(0) : null;
         double cx = first != null ? first.x() : this.serverPlayer.getX();
+        double cy = first != null ? first.y() : this.serverPlayer.getY();
         double cz = first != null ? first.z() : this.serverPlayer.getZ();
+        float yaw = first != null ? first.yaw() : this.serverPlayer.getYRot();
+        float pitch = first != null ? first.pitch() : this.serverPlayer.getXRot();
         int chunkX = (int) Math.floor(cx / 16.0);
         int chunkZ = (int) Math.floor(cz / 16.0);
         int viewDistance = Math.max(8, this.serverPlayer.requestedViewDistance());
         send(new ClientboundSetChunkCacheCenterPacket(chunkX, chunkZ));
         send(new ClientboundSetChunkCacheRadiusPacket(viewDistance));
         send(new ClientboundSetSimulationDistancePacket(viewDistance));
+        // Plant the viewer's local player at the scene-start coordinates. Vanilla's
+        // LevelLoadStatusManager counts chunks within view distance of the LOCAL
+        // PLAYER POSITION; without this teleport the player sits at default (0,0,0)
+        // and our chunks (at scene coords) don't count toward "enough chunks loaded",
+        // so the loading screen blocks indefinitely. Once the camera anchor takes
+        // over via SetCameraPacket the player's literal position becomes irrelevant
+        // for rendering, but the chunk-loaded check needs it to be in the right area.
+        PositionMoveRotation pmr = new PositionMoveRotation(
+                new Vec3(cx, cy, cz), Vec3.ZERO, yaw, pitch);
+        send(new ClientboundPlayerPositionPacket(++this.teleportSeq, pmr, java.util.Set.<Relative>of()));
     }
 
     private void tick() {
