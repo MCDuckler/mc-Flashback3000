@@ -48,7 +48,9 @@ public final class PacketIds {
     public static final int DOWNLOAD_CHUNK_SIZE = 32 * 1024;
     public static final int DOWNLOAD_WINDOW = 16;
 
-    public static final int UPLOAD_CHUNK_SIZE = 32 * 1024;
+    // Mojang's ServerboundCustomPayloadPacket caps payload bytes at 32767. Account for our
+    // header (1 opcode + 16 UUID + 4 index + 4 length-prefix = 25 bytes) and leave margin.
+    public static final int UPLOAD_CHUNK_SIZE = 30 * 1024;
     public static final int UPLOAD_WINDOW = 16;
     public static final int UPLOAD_MAX_BYTES = 4 * 1024 * 1024;
 
