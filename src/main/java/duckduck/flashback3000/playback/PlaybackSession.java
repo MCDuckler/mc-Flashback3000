@@ -27,6 +27,7 @@ import net.minecraft.network.protocol.game.ClientboundSetPlayerTeamPacket;
 import net.minecraft.network.protocol.game.ClientboundSetScorePacket;
 import net.minecraft.network.protocol.game.ClientboundTabListPacket;
 import net.minecraft.network.protocol.game.ClientboundUpdateAdvancementsPacket;
+import net.minecraft.network.protocol.game.ClientboundUpdateAttributesPacket;
 import net.minecraft.network.protocol.game.GameProtocols;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerPlayer;
@@ -327,6 +328,10 @@ public class PlaybackSession {
                 || packet instanceof ClientboundPlayerInfoRemovePacket
                 || packet instanceof ClientboundTabListPacket
                 || packet instanceof ClientboundUpdateAdvancementsPacket
+                // Recorder sometimes captures attribute updates for non-living entities
+                // (Item Display, Block Display, etc). Vanilla client throws
+                // IllegalStateException on those. Drop wholesale for trailer use.
+                || packet instanceof ClientboundUpdateAttributesPacket
                 // Recorded keep-alives would make the client echo a stale id, which Paper
                 // checks against its own pending ping -> "out-of-order" disconnect. The
                 // real server keep-alive is allowed through the filter on write side.
