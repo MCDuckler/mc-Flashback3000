@@ -25,6 +25,7 @@ import net.minecraft.network.protocol.game.ClientboundPlayerInfoRemovePacket;
 import net.minecraft.network.protocol.game.ClientboundPlayerInfoUpdatePacket;
 import net.minecraft.network.protocol.game.ClientboundPlayerPositionPacket;
 import net.minecraft.network.protocol.game.ClientboundResetScorePacket;
+import net.minecraft.network.protocol.game.ClientboundRespawnPacket;
 import net.minecraft.network.protocol.game.ClientboundRotateHeadPacket;
 import net.minecraft.network.protocol.game.ClientboundSetDisplayObjectivePacket;
 import net.minecraft.network.protocol.game.ClientboundSetObjectivePacket;
@@ -118,6 +119,7 @@ public class PlaybackSession {
                 return;
             }
             try {
+                wipeClientWorld();
                 this.currentChunk = this.replay.readChunk(this.replay.chunkOrder().get(0));
                 this.dispatchSnapshot();
                 this.snapshotSent = true;
@@ -176,6 +178,23 @@ public class PlaybackSession {
     private void dispatchSnapshot() {
         for (RawAction action : this.currentChunk.snapshot()) {
             dispatch(action);
+        }
+    }
+
+    /**
+     * Send a Respawn with dataToKeep=0 so the client tears down its current
+     * ClientLevel: entities + scoreboards + boss bars + container menus +
+     * attribute maps are all cleared. The subsequent snapshot then bootstraps
+     * the recording's world into a clean slate, which prevents duplicate
+     * entity UUID collisions and stale-state mismatches with the recording's
+     * mid-stream UPDATE actions.
+     */
+    private void wipeClientWorld() {
+        try {
+            var info = this.serverPlayer.createCommonSpawnInfo(this.serverPlayer.level());
+            send(new ClientboundRespawnPacket(info, (byte) 0));
+        } catch (Throwable t) {
+            this.plugin.getLogger().warning("wipeClientWorld failed (continuing): " + t);
         }
     }
 
@@ -311,11 +330,13 @@ public class PlaybackSession {
     }
 
     /**
-     * Packets the recorder captures mid-stream that reference state the snapshot
-     * doesn't reconstruct. Letting them through during scene playback corrupts
-     * the client's local maps (e.g. team UPDATE with no prior ADD) and triggers
-     * a "Network Protocol Error" disconnect. None of these matter for a
-     * cinematic trailer, so drop them.
+     * Defense in depth on top of {@link #wipeClientWorld()}. The respawn-clear
+     * sets the client to a clean slate before the snapshot replays, but the
+     * recorder snapshot only restores chunks + entities — it doesn't restore
+     * mid-recording transient state (an open chest GUI, a boss bar created
+     * after recording start, a team modified during the recording window).
+     * Mid-stream UPDATE/REMOVE actions for those still slip in, so this drop
+     * list keeps catching them without the cinematic trailer caring.
      */
     private static boolean shouldDropForScene(Packet<?> packet) {
         // Stateful packets the recorder snapshot doesn't reconstruct. Letting them
