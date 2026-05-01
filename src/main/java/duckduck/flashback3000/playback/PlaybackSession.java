@@ -112,7 +112,18 @@ public class PlaybackSession {
         this.channel.eventLoop().execute(() -> {
             try {
                 if (this.channel.pipeline().get(PlaybackFilter.NAME) == null) {
-                    this.channel.pipeline().addBefore("unbundler", PlaybackFilter.NAME, this.filter);
+                    // Install at the very tail so the filter intercepts outbound writes
+                    // BEFORE the unbundler splits server bundles into delimiter+sub
+                    // sequences. Packet bundles emitted by ServerEntity tracking arrive
+                    // here intact, lets us drop the whole bundle (otherwise the unbundler
+                    // emits sub-packets we drop, but downstream pipeline still produces
+                    // delimiter bytes on the wire that the client reassembles into a
+                    // bundle missing some sub-packets -> NPE / AIOOBE in the bundle
+                    // handler). Inbound is consumed by packet_handler upstream so this
+                    // filter is effectively outbound-only at this position, which is
+                    // fine — recorded keep-alives are already suppressed at dispatch
+                    // and plugin messages still reach ServerProtocol via packet_handler.
+                    this.channel.pipeline().addLast(PlaybackFilter.NAME, this.filter);
                 }
             } catch (Throwable t) {
                 this.plugin.getLogger().severe("Failed to install playback filter: " + t);
