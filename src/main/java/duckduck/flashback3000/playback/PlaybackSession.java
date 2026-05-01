@@ -637,12 +637,6 @@ public class PlaybackSession {
 
         EndBehavior end = this.plan != null ? this.plan.endBehavior() : EndBehavior.KICK;
         this.filter.setActive(false);
-        // Block any outbound bundles for the next few seconds. Entity-tracker
-        // re-engagement during PlayerStateRestore emits a re-track storm of
-        // bundled entity-init packets; one of them carries a shape vanilla
-        // can't apply (the exact packet is hidden by the bundle crash-report
-        // formatter bug, AIOOBE 0/14). 5 s covers the burst.
-        this.filter.blockBundlesFor(5000);
 
         if (end == EndBehavior.KICK) {
             Bukkit.getScheduler().runTask(this.plugin, () -> {

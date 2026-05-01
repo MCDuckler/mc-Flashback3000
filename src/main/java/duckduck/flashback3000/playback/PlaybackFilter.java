@@ -20,7 +20,6 @@ public class PlaybackFilter extends ChannelDuplexHandler {
     private static final java.util.Set<String> SEEN = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     private volatile boolean active = true;
-    private volatile long bundleBlockUntilMillis = 0;
 
     public void setActive(boolean active) {
         this.active = active;
@@ -69,28 +68,22 @@ public class PlaybackFilter extends ChannelDuplexHandler {
      * the vanilla client's per-entity data array overflows. ModelEngine emits
      * custom data slots above any vanilla entity's range.
      */
-    private boolean isDangerousForVanilla(Object msg) {
+    private static boolean isDangerousForVanilla(Object msg) {
         if (msg == null) return false;
-        // Permanent: SetEntityData with field id past vanilla's per-entity array.
+        if (isProtectedPacket(msg.getClass())) return true;
         if (msg instanceof ClientboundSetEntityDataPacket sed) return hasHighField(sed);
         if (msg instanceof BundlePacket<?> bp) {
             for (Packet<?> sub : bp.subPackets()) {
+                if (sub == null) continue;
+                if (isProtectedPacket(sub.getClass())) return true;
                 if (sub instanceof ClientboundSetEntityDataPacket sed && hasHighField(sed)) return true;
             }
-            // Temporal: during the RESTORE re-track burst right after scene end,
-            // ServerEntity emits a flurry of entity-init bundles. One of them
-            // contains a sub-packet shape vanilla can't apply (truncated stack
-            // gives "AIOOBE 0/14" with no inner trace, so the exact culprit is
-            // hidden by Mojang's bundle crash-report bug). Drop all bundles for
-            // the configured window to ride out the burst; entity tracking
-            // resumes normally after the window via individual packets.
-            if (System.currentTimeMillis() < this.bundleBlockUntilMillis) return true;
         }
         return false;
     }
 
-    public void blockBundlesFor(long millis) {
-        this.bundleBlockUntilMillis = System.currentTimeMillis() + millis;
+    private static boolean isProtectedPacket(Class<?> c) {
+        return c.getName().startsWith("com.ticxo.modelengine.");
     }
 
     private static boolean hasHighField(ClientboundSetEntityDataPacket sed) {
