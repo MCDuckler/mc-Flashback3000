@@ -26,6 +26,9 @@ import net.minecraft.network.protocol.game.ClientboundOpenScreenPacket;
 import net.minecraft.core.UUIDUtil;
 import net.minecraft.network.protocol.game.ClientboundAddEntityPacket;
 import net.minecraft.network.protocol.game.ClientboundEntityPositionSyncPacket;
+import net.minecraft.network.protocol.game.ClientboundForgetLevelChunkPacket;
+import net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket;
+import net.minecraft.network.protocol.game.ClientboundLoginPacket;
 import net.minecraft.network.protocol.game.ClientboundGameEventPacket;
 import net.minecraft.network.protocol.game.ClientboundPlayerInfoRemovePacket;
 import net.minecraft.network.protocol.game.ClientboundPlayerInfoUpdatePacket;
@@ -119,6 +122,15 @@ public class PlaybackSession {
     // off the player at start so their HUD chrome doesn't clutter the cinematic,
     // and reattach at end so post-trailer play resumes with the same bars.
     private final java.util.List<org.bukkit.boss.KeyedBossBar> savedBossBars = new java.util.ArrayList<>();
+
+    // Per-segment client state we've installed so we can tear it down at the
+    // segment boundary without a full Respawn (and thus without the vanilla
+    // "Loading terrain" screen). Tracks every entity id we sent AddEntity for
+    // and every chunk we sent ClientboundLevelChunkWithLightPacket for; on
+    // segment advance we emit RemoveEntities + ForgetLevelChunk for the whole
+    // set, then dispatch the next segment's snapshot fresh.
+    private final java.util.Set<Integer> liveEntityIds = new java.util.HashSet<>();
+    private final java.util.Set<Long> liveChunks = new java.util.HashSet<>();
 
     public PlaybackSession(Flashback3000 plugin, Player bukkitPlayer, ReplayFile replay) {
         this(plugin, bukkitPlayer, replay, null, null);
@@ -268,6 +280,31 @@ public class PlaybackSession {
      * entity UUID collisions and stale-state mismatches with the recording's
      * mid-stream UPDATE actions.
      */
+    /**
+     * Use the same trick as Toolbox3000's ScreenFade: title with the U+D6FD
+     * character which the CTA resource-pack font maps to a full-screen black
+     * sprite. Falls back to a normal small character on viewers without the
+     * resource pack but the function still runs harmlessly.
+     */
+    private void sendBlackFade(int fadeInMs, int stayMs, int fadeOutMs) {
+        try {
+            net.kyori.adventure.title.Title.Times times = net.kyori.adventure.title.Title.Times.times(
+                    java.time.Duration.ofMillis(fadeInMs),
+                    java.time.Duration.ofMillis(stayMs),
+                    java.time.Duration.ofMillis(fadeOutMs));
+            // U+D47F: the same character Toolbox3000's ScreenFade uses; the CTA
+            // resource-pack font maps it to a full-screen black sprite.
+            net.kyori.adventure.text.Component black = net.kyori.adventure.text.Component
+                    .text("푿")
+                    .color(net.kyori.adventure.text.format.NamedTextColor.BLACK);
+            net.kyori.adventure.title.Title title = net.kyori.adventure.title.Title.title(
+                    black, net.kyori.adventure.text.Component.empty(), times);
+            this.bukkitPlayer.showTitle(title);
+        } catch (Throwable t) {
+            this.plugin.getLogger().fine("Fade-to-black failed: " + t);
+        }
+    }
+
     private void clearViewerBossBars() {
         try {
             var iter = org.bukkit.Bukkit.getBossBars();
@@ -331,7 +368,11 @@ public class PlaybackSession {
             // Current segment finished. Advance to next or finish trailer.
             if (this.task != null) { this.task.cancel(); this.task = null; }
             if (this.plan != null && !this.plan.isLast(this.segmentIndex)) {
-                advanceToNextSegment();
+                // Black fade covers the inter-segment hand-off (entity unwind +
+                // chunk forget + new snapshot dispatch). 200ms fade-in, 600ms
+                // hold, 200ms fade-out. Advance fires once we're fully black.
+                sendBlackFade(200, 600, 200);
+                Bukkit.getScheduler().runTaskLater(this.plugin, this::advanceToNextSegment, 4L);
             } else {
                 finish("Trailer complete");
             }
@@ -350,13 +391,16 @@ public class PlaybackSession {
     }
 
     /**
-     * Close the current segment's replay file and load the next segment's,
-     * then re-do the wipe + snapshot + camera-anchor + skip-ahead pipeline so
-     * the new segment's world replaces the previous one cleanly. Entity-id
-     * collisions across recordings are eliminated by the wipe-Respawn.
+     * Close the current segment's replay file, tear down its installed client
+     * state via {@link #unwindSegment()}, then load the next segment and
+     * dispatch its snapshot. No Respawn is sent between segments, so the
+     * vanilla "Loading terrain" screen never shows; the client level stays
+     * live and we explicitly clear per-segment state instead.
      */
     private void advanceToNextSegment() {
         if (this.finished) return;
+        // Tear down THIS segment's installed state on the client.
+        unwindSegment();
         try { if (this.replay != null) this.replay.close(); } catch (Exception ignored) {}
         this.segmentIndex++;
         this.currentSegment = this.plan.segments().get(this.segmentIndex);
@@ -367,9 +411,9 @@ public class PlaybackSession {
             finish("Segment open failed");
             return;
         }
-        // Reset per-segment state. Camera-entity stays alive only on the
-        // client; client-side it gets wiped by the next Respawn so we re-spawn
-        // it via installCameraAnchor below.
+        // Reset per-segment state. Camera anchor entity stays alive across
+        // segments - we just teleport it to the new sample. Game mode also
+        // stays SPECTATOR so we don't re-emit the change-gamemode packet.
         this.chunkIndex = 0;
         this.tickInChunk = 0;
         this.globalTick = 0;
@@ -377,7 +421,6 @@ public class PlaybackSession {
         this.loadStartSent = false;
         this.chunkBatchOpen = false;
         this.snapshotChunkCount = 0;
-        this.cameraEntityId = -1;
         this.droppedClassesSeen.clear();
         this.plugin.getLogger().info("Trailer segment " + this.segmentIndex
                 + " start: replay=" + this.currentSegment.replayId()
@@ -387,10 +430,17 @@ public class PlaybackSession {
         this.filter.setActive(true);
         this.channel.eventLoop().execute(() -> {
             try {
-                wipeClientWorld();
                 this.currentChunk = this.replay.readChunk(this.replay.chunkOrder().get(0));
                 this.dispatchSnapshot();
-                if (this.plan.overrideCamera()) installCameraAnchor();
+                // Camera anchor lives across segments; teleport it to this
+                // segment's first sample so the cut isn't a hard view jump.
+                if (this.plan.overrideCamera()) {
+                    ParsedScenes.CameraSample first = !this.currentSegment.samples().isEmpty()
+                            ? this.currentSegment.samples().get(0) : null;
+                    if (first != null && this.cameraEntityId >= 0) {
+                        sendCameraOverride(first);
+                    }
+                }
                 this.snapshotSent = true;
             } catch (Throwable t) {
                 this.plugin.getLogger().severe("Failed to dispatch segment snapshot: " + t);
@@ -403,6 +453,38 @@ public class PlaybackSession {
                 scheduleTickTimer();
             }
         });
+    }
+
+    /**
+     * Drop every entity and chunk this segment installed on the client without
+     * a Respawn. Called between segments to avoid the vanilla "Loading terrain"
+     * screen. The client-level instance stays live; only the recording's
+     * tracked state goes away.
+     */
+    private void unwindSegment() {
+        if (!this.liveEntityIds.isEmpty()) {
+            int[] ids = new int[this.liveEntityIds.size()];
+            int i = 0;
+            for (int id : this.liveEntityIds) ids[i++] = id;
+            this.liveEntityIds.clear();
+            // Don't drop our own camera anchor; if the recording happened to
+            // touch it (it shouldn't since we use a high-offset id), keep it.
+            if (this.cameraEntityId >= 0) {
+                int[] filtered = new int[ids.length];
+                int n = 0;
+                for (int id : ids) if (id != this.cameraEntityId) filtered[n++] = id;
+                ids = java.util.Arrays.copyOf(filtered, n);
+            }
+            if (ids.length > 0) {
+                send(new ClientboundRemoveEntitiesPacket(ids));
+            }
+        }
+        if (!this.liveChunks.isEmpty()) {
+            for (long packed : this.liveChunks) {
+                send(new ClientboundForgetLevelChunkPacket(new net.minecraft.world.level.ChunkPos(packed)));
+            }
+            this.liveChunks.clear();
+        }
     }
 
     private void dispatchTick(boolean applyCameraOverride) {
@@ -531,6 +613,15 @@ public class PlaybackSession {
                         && packet instanceof ClientboundPlayerPositionPacket) {
                     return;
                 }
+                // For trailer segments after the first, skip the recorded
+                // LoginPacket - the client is already in the world from the
+                // previous segment and we don't want to trigger Mojang's
+                // ReceivingLevelScreen ("Loading terrain"). The other state
+                // packets in the snapshot (border, time, spawn) re-apply
+                // fine without a relog.
+                if (this.segmentIndex > 0 && packet instanceof ClientboundLoginPacket) {
+                    return;
+                }
                 if (this.plan != null && shouldDropForScene(packet, this.dispatchingSnapshot)) {
                     String name = packet.getClass().getSimpleName();
                     if (this.droppedClassesSeen.add(name)) {
@@ -583,6 +674,16 @@ public class PlaybackSession {
                 // array (-> AIOOBE -> kick).
                 if (packet instanceof ClientboundAddEntityPacket add) {
                     send(new ClientboundRemoveEntitiesPacket(add.getId()));
+                    this.liveEntityIds.add(add.getId());
+                }
+                if (packet instanceof ClientboundRemoveEntitiesPacket rem) {
+                    for (int id : rem.getEntityIds()) this.liveEntityIds.remove(id);
+                }
+                if (packet instanceof ClientboundLevelChunkWithLightPacket chunk) {
+                    this.liveChunks.add(net.minecraft.world.level.ChunkPos.asLong(chunk.getX(), chunk.getZ()));
+                }
+                if (packet instanceof ClientboundForgetLevelChunkPacket forget) {
+                    this.liveChunks.remove(forget.pos().toLong());
                 }
                 send(packet);
             } else if (type.equals(LEVEL_CHUNK_CACHED)) {
@@ -599,6 +700,9 @@ public class PlaybackSession {
                 }
                 if (this.dispatchingSnapshot) {
                     this.snapshotChunkCount++;
+                }
+                if (packet instanceof ClientboundLevelChunkWithLightPacket chunk) {
+                    this.liveChunks.add(net.minecraft.world.level.ChunkPos.asLong(chunk.getX(), chunk.getZ()));
                 }
                 send(packet);
             } else if (type.equals(MOVE_ENTITIES)) {
