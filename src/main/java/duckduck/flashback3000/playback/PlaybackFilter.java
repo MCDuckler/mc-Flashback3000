@@ -4,6 +4,7 @@ import duckduck.flashback3000.protocol.PacketIds;
 import io.netty.channel.ChannelDuplexHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelPromise;
+import net.minecraft.network.protocol.common.ClientboundKeepAlivePacket;
 import net.minecraft.network.protocol.common.ServerboundCustomPayloadPacket;
 import net.minecraft.network.protocol.common.ServerboundKeepAlivePacket;
 import net.minecraft.network.protocol.common.ServerboundPongPacket;
@@ -29,7 +30,14 @@ public class PlaybackFilter extends ChannelDuplexHandler {
             return;
         }
         if (this.active) {
-            // Drop real-server emissions during playback so they don't fight the trailer.
+            // Allow real-server keep-alive pings so Paper's keep-alive timeout doesn't
+            // disconnect the viewer mid-playback. The recorded keep-alives are dropped
+            // by PlaybackSession, so the client only echoes ids the real server expects.
+            if (msg instanceof ClientboundKeepAlivePacket) {
+                ctx.write(msg, promise);
+                return;
+            }
+            // Drop other real-server emissions during playback so they don't fight the trailer.
             promise.setSuccess();
             return;
         }

@@ -13,6 +13,7 @@ import net.minecraft.network.RegistryFriendlyByteBuf;
 import net.minecraft.network.codec.StreamCodec;
 import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.game.ClientGamePacketListener;
+import net.minecraft.network.protocol.common.ClientboundKeepAlivePacket;
 import net.minecraft.network.protocol.game.ClientboundBossEventPacket;
 import net.minecraft.network.protocol.game.ClientboundEntityPositionSyncPacket;
 import net.minecraft.network.protocol.game.ClientboundPlayerInfoRemovePacket;
@@ -325,7 +326,11 @@ public class PlaybackSession {
                 || packet instanceof ClientboundPlayerInfoUpdatePacket
                 || packet instanceof ClientboundPlayerInfoRemovePacket
                 || packet instanceof ClientboundTabListPacket
-                || packet instanceof ClientboundUpdateAdvancementsPacket;
+                || packet instanceof ClientboundUpdateAdvancementsPacket
+                // Recorded keep-alives would make the client echo a stale id, which Paper
+                // checks against its own pending ping -> "out-of-order" disconnect. The
+                // real server keep-alive is allowed through the filter on write side.
+                || packet instanceof ClientboundKeepAlivePacket;
     }
 
     @SuppressWarnings("unchecked")
