@@ -94,6 +94,7 @@ public class Recorder {
     private final ConcurrentLinkedQueue<Packet<?>> pendingPackets = new ConcurrentLinkedQueue<>();
     private final AtomicReference<Throwable> capturedError = new AtomicReference<>();
     private final java.util.WeakHashMap<Entity, EntityPos> lastPositions = new java.util.WeakHashMap<>();
+    private final java.util.HashMap<Integer, EntityPos> lastCachedPositions = new java.util.HashMap<>();
 
     private duckduck.flashback3000.cache.PerPlayerContext playerCtx;
 
@@ -452,11 +453,13 @@ public class Recorder {
     private void writeEntityPositions() {
         ServerLevel level = this.serverPlayer.level();
         List<EntityPos> changed = new ArrayList<>();
+        java.util.Set<Integer> nmsIds = new java.util.HashSet<>();
         for (Entity entity : level.getEntities().getAll()) {
             // Local player is included so their position tracks during playback. Their entity
             // id matches what the snapshot's create_local_player action assigned.
             if (shouldIgnoreEntity(entity)) continue;
             if (entity != this.serverPlayer && ModelEngineCompat.shouldHideBase(entity)) continue;
+            nmsIds.add(entity.getId());
             net.minecraft.world.phys.Vec3 pos = entity.trackingPosition();
             EntityPos current = new EntityPos(entity.getId(),
                     pos.x, pos.y, pos.z,
@@ -466,6 +469,24 @@ public class Recorder {
             if (current.equals(last)) continue;
             this.lastPositions.put(entity, current);
             changed.add(current);
+        }
+        // ME pivots (AEC packet-only) aren't in level.getEntities() — they're never registered
+        // server-side. Flashback's playback handleEntityPositionSync just forwards the EPS to
+        // the viewer client; the playback ServerLevel's pivot stays at AddEntity pos forever,
+        // so server-side rideTick on bones positions them at stale pivot pos. Emit
+        // ActionMoveEntities for each cached vehicle (anything with passengers) so playback
+        // calls snapTo + updatePositionOfPassengers — that recurses through SP chains and
+        // moves ME bones via positionRider.
+        if (this.playerCtx != null) {
+            this.playerCtx.cache.forEachVehicle(vp -> {
+                if (nmsIds.contains(vp.id())) return;
+                EntityPos current = new EntityPos(vp.id(), vp.x(), vp.y(), vp.z(),
+                        vp.yRot(), vp.xRot(), vp.yHeadRot(), vp.onGround());
+                EntityPos last = this.lastCachedPositions.get(vp.id());
+                if (current.equals(last)) return;
+                this.lastCachedPositions.put(vp.id(), current);
+                changed.add(current);
+            });
         }
         if (changed.isEmpty()) return;
         ResourceKey<Level> dim = level.dimension();

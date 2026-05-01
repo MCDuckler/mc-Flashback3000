@@ -202,25 +202,6 @@ public final class EntityStateCache {
         // and avoids surprises for any consumer that processes packets in stream order.
         List<Map.Entry<Integer, State>> snapshot = new ArrayList<>(entities.entrySet());
 
-        // Snapshot current pos + passenger lists into local maps without holding multiple
-        // State locks at once. Used below to anchor each entity at its root vehicle's
-        // current position rather than its own stale AddEntity position.
-        record Pos(double x, double y, double z) {}
-        Map<Integer, Pos> currentPos = new java.util.HashMap<>(snapshot.size());
-        Map<Integer, Integer> passengerToVehicle = new java.util.HashMap<>();
-        for (Map.Entry<Integer, State> entry : snapshot) {
-            int id = entry.getKey();
-            State s = entry.getValue();
-            synchronized (s) {
-                currentPos.put(id, new Pos(s.x, s.y, s.z));
-                if (s.passengers != null) {
-                    int[] pids = s.passengers.getPassengers();
-                    int vehicle = s.passengers.getVehicle();
-                    for (int pid : pids) passengerToVehicle.put(pid, vehicle);
-                }
-            }
-        }
-
         for (Map.Entry<Integer, State> entry : snapshot) {
             int id = entry.getKey();
             if (id == recordingPlayerId) continue;
@@ -228,25 +209,15 @@ public final class EntityStateCache {
             synchronized (s) {
                 if (s.uuid == null || s.type == null) continue; // never saw AddEntity
 
-                // Walk passenger chain to root vehicle, anchor at root's current pos. ME
-                // bones (ITEM_DISPLAY) are passengers whose Display.tick override skips
-                // super.tick → rideTick → positionRider, so the client renders from the
-                // anchor set at AddEntity time forever. Native Flashback's client recorder
-                // reads the bone's CURRENT pos (which client-side positionRider has been
-                // updating to vehicle pos every tick) — we mimic by resolving the chain.
-                double x = s.x, y = s.y, z = s.z;
-                Integer vehicleId = passengerToVehicle.get(id);
-                int hops = 0;
-                while (vehicleId != null && hops++ < 16) {
-                    Pos vp = currentPos.get(vehicleId);
-                    if (vp == null) break;
-                    x = vp.x; y = vp.y; z = vp.z;
-                    vehicleId = passengerToVehicle.get(vehicleId);
-                }
-
+                // Anchor at the entity's own cached pos. The per-tick ActionMoveEntities loop
+                // in Recorder picks this back up for cached vehicles (entities with passengers)
+                // and tells Flashback's playback to run updatePositionOfPassengers, which
+                // propagates motion to ME bones. Bones themselves are skipped by that loop —
+                // they spawn here at their AddEntity pos (already pivot pos + the AEC/ITEM_DISPLAY
+                // height offset) and are repositioned each tick by positionRider on playback.
                 out.accept(new ClientboundAddEntityPacket(
                         id, s.uuid,
-                        x, y, z,
+                        s.x, s.y, s.z,
                         s.xRot, s.yRot,
                         s.type, s.data, s.deltaMovement, s.yHeadRot));
 
@@ -265,6 +236,32 @@ public final class EntityStateCache {
             State s = entry.getValue();
             synchronized (s) {
                 if (s.passengers != null) out.accept(s.passengers);
+            }
+        }
+    }
+
+    /**
+     * Snapshot of one cached entity that has passengers. Used by {@link Recorder}'s per-tick
+     * ActionMoveEntities loop to drive Flashback's {@code updatePositionOfPassengers} for
+     * packet-only entities (ME pivots, etc.) whose server-side position is never updated by
+     * Flashback's playback (its EPS handler just relays the packet to the viewer client).
+     */
+    public record VehiclePos(int id, double x, double y, double z,
+                             float yRot, float xRot, float yHeadRot, boolean onGround) {}
+
+    /**
+     * Iterate cached entities that currently have passengers and emit one {@link VehiclePos}
+     * per entity with the latest cached position. Includes vanilla entities too — the caller
+     * is expected to filter out IDs that are already covered by the NMS-level loop.
+     */
+    public void forEachVehicle(Consumer<VehiclePos> out) {
+        for (Map.Entry<Integer, State> entry : entities.entrySet()) {
+            State s = entry.getValue();
+            synchronized (s) {
+                if (s.passengers == null) continue;
+                if (s.uuid == null || s.type == null) continue;
+                out.accept(new VehiclePos(entry.getKey(), s.x, s.y, s.z,
+                        s.yRot, s.xRot, s.yHeadRot, s.onGround));
             }
         }
     }
