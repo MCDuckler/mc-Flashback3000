@@ -15,6 +15,8 @@ import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.game.ClientGamePacketListener;
 import net.minecraft.network.protocol.common.ClientboundKeepAlivePacket;
 import net.minecraft.network.protocol.game.ClientboundBossEventPacket;
+import net.minecraft.network.protocol.game.ClientboundChunkBatchFinishedPacket;
+import net.minecraft.network.protocol.game.ClientboundChunkBatchStartPacket;
 import net.minecraft.network.protocol.game.ClientboundContainerClosePacket;
 import net.minecraft.network.protocol.game.ClientboundContainerSetContentPacket;
 import net.minecraft.network.protocol.game.ClientboundContainerSetDataPacket;
@@ -88,6 +90,8 @@ public class PlaybackSession {
     private boolean finished = false;
     private boolean dispatchingSnapshot = false;
     private boolean loadStartSent = false;
+    private boolean chunkBatchOpen = false;
+    private int snapshotChunkCount = 0;
     private @Nullable BukkitTask task;
     private final Set<String> droppedClassesSeen = new HashSet<>();
 
@@ -212,12 +216,20 @@ public class PlaybackSession {
 
     private void dispatchSnapshot() {
         this.dispatchingSnapshot = true;
+        this.snapshotChunkCount = 0;
         try {
             for (RawAction action : this.currentChunk.snapshot()) {
                 dispatch(action);
             }
         } finally {
             this.dispatchingSnapshot = false;
+            // Close the chunk batch we may have opened so the client knows the
+            // initial chunk burst is done and can transition out of "Loading
+            // terrain" with the right tick-rate measurement.
+            if (this.chunkBatchOpen) {
+                send(new ClientboundChunkBatchFinishedPacket(this.snapshotChunkCount));
+                this.chunkBatchOpen = false;
+            }
         }
     }
 
@@ -377,13 +389,36 @@ public class PlaybackSession {
                     }
                     return;
                 }
-                // Send LEVEL_CHUNKS_LOAD_START right before the first chunk arrives.
-                // Vanilla expects this hint before chunk streaming begins; sending it
-                // after all chunks were already streamed leaves the client stuck on
-                // the "Loading terrain" screen for several seconds.
+                // Defensive: a recorded SetEntityData may carry field indices that
+                // exceed the receiving entity's data-array length when the recording
+                // came from a ModelEngine-augmented server (extra custom fields) or
+                // when the server reused an entity id and the recording's mid-stream
+                // updates target a different entity type than the snapshot's
+                // AddEntity. Either way the vanilla client throws AIOOBE during
+                // bundle apply -> kick. Drop only the offending packet (high field
+                // indices), keep low-index ones so vanilla animations still flow.
+                if (this.plan != null
+                        && !this.dispatchingSnapshot
+                        && packet instanceof ClientboundSetEntityDataPacket sed
+                        && hasOutOfBoundsField(sed)) {
+                    if (this.droppedClassesSeen.add("SetEntityData[oob]")) {
+                        this.plugin.getLogger().info("Scene playback dropped SetEntityData with out-of-bounds field index");
+                    }
+                    return;
+                }
+                // Open the initial chunk batch right before the first chunk packet.
+                // Vanilla's LevelLoadStatusManager waits for ChunkBatchStart +
+                // chunks + ChunkBatchFinished to leave "Loading terrain"; sending
+                // chunks without that envelope leaves the client stuck on the
+                // loading screen even after all chunks already arrived.
                 if (!this.loadStartSent && packet instanceof net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket) {
                     send(new ClientboundGameEventPacket(ClientboundGameEventPacket.LEVEL_CHUNKS_LOAD_START, 0.0F));
+                    send(ClientboundChunkBatchStartPacket.INSTANCE);
                     this.loadStartSent = true;
+                    this.chunkBatchOpen = true;
+                }
+                if (this.dispatchingSnapshot && packet instanceof net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket) {
+                    this.snapshotChunkCount++;
                 }
                 // Defensive: if the recording reused entity ids over its lifetime,
                 // the client may already have a tracker entry of a different type
@@ -402,7 +437,12 @@ public class PlaybackSession {
                 Packet<? super ClientGamePacketListener> packet = decodeGame(cached);
                 if (!this.loadStartSent) {
                     send(new ClientboundGameEventPacket(ClientboundGameEventPacket.LEVEL_CHUNKS_LOAD_START, 0.0F));
+                    send(ClientboundChunkBatchStartPacket.INSTANCE);
                     this.loadStartSent = true;
+                    this.chunkBatchOpen = true;
+                }
+                if (this.dispatchingSnapshot) {
+                    this.snapshotChunkCount++;
                 }
                 send(packet);
             } else if (type.equals(MOVE_ENTITIES)) {
@@ -452,6 +492,20 @@ public class PlaybackSession {
 
     private static byte encodeAngle(float deg) {
         return (byte) Math.floor(deg * 256.0f / 360.0f);
+    }
+
+    /**
+     * Vanilla 1.21.10 entity classes register at most ~28 SynchedEntityData
+     * fields (TextDisplay = 27). ModelEngine and similar packet-injection
+     * plugins emit SetEntityData with custom field indices well above that.
+     * Replaying those to a vanilla client causes an out-of-bounds write into
+     * the entity's data-array. Drop any packet that contains such a field.
+     */
+    private static boolean hasOutOfBoundsField(ClientboundSetEntityDataPacket sed) {
+        for (var dv : sed.packedItems()) {
+            if (dv.id() > 30) return true;
+        }
+        return false;
     }
 
     /**
