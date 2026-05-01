@@ -68,6 +68,9 @@ public class PlaybackManager implements Listener {
         PlaybackSession session = new PlaybackSession(this.plugin, player, replay, plan,
                 () -> this.active.remove(viewerId));
         this.active.put(viewerId, session);
+        this.plugin.getLogger().info("Scene playback start: replay=" + replayId
+                + " scene=" + sceneId + " ticks=" + scene.startTick() + "-" + scene.endTick()
+                + " viewer=" + player.getName() + " end=" + opts.end());
         session.start();
         return session;
     }

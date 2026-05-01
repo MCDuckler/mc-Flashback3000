@@ -13,13 +13,19 @@ import net.minecraft.network.RegistryFriendlyByteBuf;
 import net.minecraft.network.codec.StreamCodec;
 import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.game.ClientGamePacketListener;
+import net.minecraft.network.protocol.game.ClientboundBossEventPacket;
 import net.minecraft.network.protocol.game.ClientboundEntityPositionSyncPacket;
+import net.minecraft.network.protocol.game.ClientboundPlayerInfoRemovePacket;
+import net.minecraft.network.protocol.game.ClientboundPlayerInfoUpdatePacket;
 import net.minecraft.network.protocol.game.ClientboundPlayerPositionPacket;
+import net.minecraft.network.protocol.game.ClientboundResetScorePacket;
 import net.minecraft.network.protocol.game.ClientboundRotateHeadPacket;
 import net.minecraft.network.protocol.game.ClientboundSetDisplayObjectivePacket;
 import net.minecraft.network.protocol.game.ClientboundSetObjectivePacket;
 import net.minecraft.network.protocol.game.ClientboundSetPlayerTeamPacket;
 import net.minecraft.network.protocol.game.ClientboundSetScorePacket;
+import net.minecraft.network.protocol.game.ClientboundTabListPacket;
+import net.minecraft.network.protocol.game.ClientboundUpdateAdvancementsPacket;
 import net.minecraft.network.protocol.game.GameProtocols;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerPlayer;
@@ -33,6 +39,7 @@ import org.bukkit.entity.Player;
 import org.bukkit.scheduler.BukkitTask;
 import org.jetbrains.annotations.Nullable;
 
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
@@ -65,6 +72,7 @@ public class PlaybackSession {
     private boolean snapshotSent = false;
     private boolean finished = false;
     private @Nullable BukkitTask task;
+    private final Set<String> droppedClassesSeen = new HashSet<>();
 
     public PlaybackSession(Flashback3000 plugin, Player bukkitPlayer, ReplayFile replay) {
         this(plugin, bukkitPlayer, replay, null, null);
@@ -233,6 +241,10 @@ public class PlaybackSession {
                     return;
                 }
                 if (this.plan != null && shouldDropForScene(packet)) {
+                    String name = packet.getClass().getSimpleName();
+                    if (this.droppedClassesSeen.add(name)) {
+                        this.plugin.getLogger().info("Scene playback dropped " + name + " (filter active)");
+                    }
                     return;
                 }
                 send(packet);
@@ -299,10 +311,21 @@ public class PlaybackSession {
      * cinematic trailer, so drop them.
      */
     private static boolean shouldDropForScene(Packet<?> packet) {
+        // Stateful packets the recorder snapshot doesn't reconstruct. Letting them
+        // through during scene playback corrupts the client's local maps (team /
+        // objective / boss-bar / tab-list / advancement / player-info) and the
+        // vanilla handler hits Map.get(name).method(...) -> NPE -> "Network
+        // Protocol Error" disconnect. None matter for a cinematic trailer.
         return packet instanceof ClientboundSetPlayerTeamPacket
                 || packet instanceof ClientboundSetObjectivePacket
                 || packet instanceof ClientboundSetScorePacket
-                || packet instanceof ClientboundSetDisplayObjectivePacket;
+                || packet instanceof ClientboundResetScorePacket
+                || packet instanceof ClientboundSetDisplayObjectivePacket
+                || packet instanceof ClientboundBossEventPacket
+                || packet instanceof ClientboundPlayerInfoUpdatePacket
+                || packet instanceof ClientboundPlayerInfoRemovePacket
+                || packet instanceof ClientboundTabListPacket
+                || packet instanceof ClientboundUpdateAdvancementsPacket;
     }
 
     @SuppressWarnings("unchecked")

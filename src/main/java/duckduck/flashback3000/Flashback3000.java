@@ -68,7 +68,8 @@ public final class Flashback3000 extends JavaPlugin implements Listener {
 
         getServer().getPluginManager().registerEvents(this, this);
 
-        getLogger().info("Flashback3000 enabled. Replay output dir: " + this.recordingManager.outputRoot());
+        getLogger().info("Flashback3000 enabled (scene-playback v2, stateful-packet filter). Replay output dir: "
+                + this.recordingManager.outputRoot());
     }
 
     @Override
