@@ -6,10 +6,12 @@ import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelPromise;
 import net.minecraft.network.protocol.BundleDelimiterPacket;
 import net.minecraft.network.protocol.BundlePacket;
+import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.common.ClientboundKeepAlivePacket;
 import net.minecraft.network.protocol.common.ServerboundCustomPayloadPacket;
 import net.minecraft.network.protocol.common.ServerboundKeepAlivePacket;
 import net.minecraft.network.protocol.common.ServerboundPongPacket;
+import net.minecraft.network.protocol.game.ClientboundSetEntityDataPacket;
 
 public class PlaybackFilter extends ChannelDuplexHandler {
 
@@ -50,7 +52,40 @@ public class PlaybackFilter extends ChannelDuplexHandler {
             promise.setSuccess();
             return;
         }
+        // Inactive (post-RESTORE) but filter still installed: pass everything through
+        // EXCEPT packets the vanilla client can't safely consume from a ModelEngine-
+        // augmented server. Without this safety net the player gets kicked the moment
+        // ME's tracker emits a bundle for a model entity after scene end.
+        if (isDangerousForVanilla(msg)) {
+            promise.setSuccess();
+            return;
+        }
         ctx.write(msg, promise);
+    }
+
+    /**
+     * SetEntityData (and bundles containing it) with a field id high enough that
+     * the vanilla client's per-entity data array overflows. ModelEngine emits
+     * custom data slots above any vanilla entity's range.
+     */
+    private static boolean isDangerousForVanilla(Object msg) {
+        if (msg instanceof ClientboundSetEntityDataPacket sed) return hasHighField(sed);
+        if (msg instanceof BundlePacket<?> bp) {
+            for (Packet<?> sub : bp.subPackets()) {
+                if (sub instanceof ClientboundSetEntityDataPacket sed && hasHighField(sed)) return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean hasHighField(ClientboundSetEntityDataPacket sed) {
+        for (var dv : sed.packedItems()) {
+            // Threshold matches PlaybackSession.hasOutOfBoundsField - chosen to clear
+            // every vanilla entity (TextDisplay tops out at ~28 fields) while still
+            // catching ModelEngine custom slots > 30.
+            if (dv.id() > 24) return true;
+        }
+        return false;
     }
 
     private static void traceOnce(String origin, Object msg) {

@@ -495,15 +495,17 @@ public class PlaybackSession {
     }
 
     /**
-     * Vanilla 1.21.10 entity classes register at most ~28 SynchedEntityData
-     * fields (TextDisplay = 27). ModelEngine and similar packet-injection
-     * plugins emit SetEntityData with custom field indices well above that.
-     * Replaying those to a vanilla client causes an out-of-bounds write into
-     * the entity's data-array. Drop any packet that contains such a field.
+     * The recording can carry SetEntityData with field ids above any vanilla
+     * entity's data-array length: server-side entity-id reuse makes mid-stream
+     * updates target a different type than the snapshot's AddEntity, and
+     * ModelEngine injects custom slots well past vanilla's max. Threshold > 24
+     * is conservative (drops vanilla TextDisplay text updates whose id is 25-27,
+     * which are visually unimportant for trailers) but reliably catches the
+     * actual kicker (Index 27 / length 25 from real recordings).
      */
     private static boolean hasOutOfBoundsField(ClientboundSetEntityDataPacket sed) {
         for (var dv : sed.packedItems()) {
-            if (dv.id() > 30) return true;
+            if (dv.id() > 24) return true;
         }
         return false;
     }
@@ -610,13 +612,10 @@ public class PlaybackSession {
             });
         }
 
-        this.channel.eventLoop().execute(() -> {
-            try {
-                if (this.channel.pipeline().get(PlaybackFilter.NAME) != null) {
-                    this.channel.pipeline().remove(PlaybackFilter.NAME);
-                }
-            } catch (Throwable ignored) {}
-        });
+        // Intentionally do NOT remove the filter from the pipeline. With active=false
+        // it acts as a permanent safety net dropping ME-incompatible bundles that
+        // would otherwise crash the vanilla client during regular post-scene play.
+        // The filter goes away naturally when the connection closes.
 
         if (this.onFinish != null) {
             try { this.onFinish.run(); } catch (Throwable ignored) {}
