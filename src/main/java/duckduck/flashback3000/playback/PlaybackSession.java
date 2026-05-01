@@ -87,6 +87,7 @@ public class PlaybackSession {
     private boolean snapshotSent = false;
     private boolean finished = false;
     private boolean dispatchingSnapshot = false;
+    private boolean loadStartSent = false;
     private @Nullable BukkitTask task;
     private final Set<String> droppedClassesSeen = new HashSet<>();
 
@@ -153,7 +154,6 @@ public class PlaybackSession {
                 // Tell the client to switch from "Loading terrain" to in-game view.
                 // Recorder snapshot doesn't include this; PlayerList.sendLevelInfo
                 // sends it on a regular join.
-                send(new ClientboundGameEventPacket(ClientboundGameEventPacket.LEVEL_CHUNKS_LOAD_START, 0.0F));
                 if (this.plan != null && this.plan.overrideCamera()) {
                     installCameraAnchor();
                 }
@@ -352,6 +352,7 @@ public class PlaybackSession {
         try {
             this.currentChunk = this.replay.readChunk(this.replay.chunkOrder().get(this.chunkIndex));
             this.tickInChunk = 0;
+            this.loadStartSent = false;
             // Subsequent chunks have their own snapshot block; replay it for state continuity.
             dispatchSnapshot();
         } catch (Throwable t) {
@@ -376,12 +377,33 @@ public class PlaybackSession {
                     }
                     return;
                 }
+                // Send LEVEL_CHUNKS_LOAD_START right before the first chunk arrives.
+                // Vanilla expects this hint before chunk streaming begins; sending it
+                // after all chunks were already streamed leaves the client stuck on
+                // the "Loading terrain" screen for several seconds.
+                if (!this.loadStartSent && packet instanceof net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket) {
+                    send(new ClientboundGameEventPacket(ClientboundGameEventPacket.LEVEL_CHUNKS_LOAD_START, 0.0F));
+                    this.loadStartSent = true;
+                }
+                // Defensive: if the recording reused entity ids over its lifetime,
+                // the client may already have a tracker entry of a different type
+                // for this id. Drop the stale tracker before the new AddEntity so
+                // subsequent SetEntityData / SetEquipment field indices match the
+                // fresh entity type instead of overrunning the old type's field
+                // array (-> AIOOBE -> kick).
+                if (packet instanceof ClientboundAddEntityPacket add) {
+                    send(new ClientboundRemoveEntitiesPacket(add.getId()));
+                }
                 send(packet);
             } else if (type.equals(LEVEL_CHUNK_CACHED)) {
                 FriendlyByteBuf buf = wrap(action.payload());
                 int idx = buf.readVarInt();
                 byte[] cached = this.replay.cachedChunk(idx);
                 Packet<? super ClientGamePacketListener> packet = decodeGame(cached);
+                if (!this.loadStartSent) {
+                    send(new ClientboundGameEventPacket(ClientboundGameEventPacket.LEVEL_CHUNKS_LOAD_START, 0.0F));
+                    this.loadStartSent = true;
+                }
                 send(packet);
             } else if (type.equals(MOVE_ENTITIES)) {
                 dispatchMoveEntities(action.payload());
@@ -476,15 +498,10 @@ public class PlaybackSession {
             return true;
         }
 
-        // Mid-stream-only drops: keep these for the snapshot (so entities have their
-        // initial state), drop them after snapshot finishes. Reason: server reuses
-        // entity ids over the recording window. If id 3903 was Type A at snapshot
-        // time and Type B mid-stream, the recorded SetEntityData carries fields
-        // that exceed Type A's field-array bounds -> AIOOBE -> kick.
-        if (!inSnapshot && packet instanceof ClientboundSetEntityDataPacket) {
-            return true;
-        }
-
+        // Mid-stream entity-data is required by ModelEngine and friends to drive
+        // animations / poses on display entities. We don't drop them - instead
+        // the dispatcher pre-emits RemoveEntities before each AddEntity so the
+        // client's tracker is fresh for the right entity type at each id.
         return false;
     }
 
