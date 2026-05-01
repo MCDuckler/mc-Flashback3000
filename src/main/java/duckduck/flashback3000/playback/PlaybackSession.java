@@ -192,6 +192,13 @@ public class PlaybackSession {
                 return;
             }
             clearViewerBossBars();
+            // If the scene starts mid-recording, the skip-ahead pass replays
+            // recording actions to the client at high speed so its world state
+            // matches startTick. That's visible as fast-forward; cover the whole
+            // ramp-up (snapshot dispatch + skip-ahead) with the ScreenFade wipe
+            // so the viewer only sees the scene proper.
+            boolean needSkip = this.currentSegment != null && this.currentSegment.startTick() > 0;
+            if (needSkip) sendFadeToBlack();
             try {
                 wipeClientWorld();
                 this.currentChunk = this.replay.readChunk(this.replay.chunkOrder().get(0));
@@ -205,7 +212,7 @@ public class PlaybackSession {
                 this.finish("Snapshot dispatch failed");
                 return;
             }
-            if (this.currentSegment != null && this.currentSegment.startTick() > 0) {
+            if (needSkip) {
                 runSkipAheadPass();
             } else {
                 scheduleTickTimer();
@@ -242,6 +249,10 @@ public class PlaybackSession {
         if (this.globalTick < target) {
             this.channel.eventLoop().execute(this::runSkipAheadPass);
         } else {
+            // Skip done: clear the ScreenFade wipe so the viewer sees the
+            // scene proper. Safe to call even if no fade was up; it just
+            // sends a fade-out title to an already-clear screen.
+            sendFadeFromBlack();
             scheduleTickTimer();
         }
     }
@@ -286,6 +297,26 @@ public class PlaybackSession {
      * sprite. Falls back to a normal small character on viewers without the
      * resource pack but the function still runs harmlessly.
      */
+    /**
+     * Cover the screen with the ScreenFade wipe and hold it for far longer
+     * than any single transition will need. The companion {@link #sendFadeFromBlack}
+     * call replaces this title and starts the fade-out the moment we're ready
+     * to reveal the next scene. Hold = 1200 ticks (60 s) is comfortably longer
+     * than the worst-case skip-ahead pass + dispatch.
+     */
+    private void sendFadeToBlack() {
+        sendBlackFade(18, 1200, 0);
+    }
+
+    /**
+     * Replace any active ScreenFade title with a fade-out-only one so the
+     * black wipe retracts as the scene begins. Mirrors Toolbox3000.ScreenFade
+     * .fadeFromBlack(player, fadeOutMs).
+     */
+    private void sendFadeFromBlack() {
+        sendBlackFade(0, 0, 24);
+    }
+
     private void sendBlackFade(int fadeInTicks, int stayTicks, int fadeOutTicks) {
         try {
             // Match Toolbox3000.ScreenFade exactly: U+D47F + RGB(1,7,1) tint.
@@ -426,12 +457,13 @@ public class PlaybackSession {
             // Current segment finished. Advance to next or finish trailer.
             if (this.task != null) { this.task.cancel(); this.task = null; }
             if (this.plan != null && !this.plan.isLast(this.segmentIndex)) {
-                // Black fade covers the inter-segment hand-off (entity unwind +
-                // chunk forget + new snapshot dispatch). Match CinematicTeleport
-                // timings: 900ms in, 600ms hold, 1200ms out (18t / 12t / 24t).
-                // Advance fires (FADE_IN_TICKS + 3) ticks in, when the wipe is
-                // fully closed — same offset CinematicTeleport uses.
-                sendBlackFade(18, 12, 24);
+                // Cover the entire inter-segment hand-off (entity unwind +
+                // chunk forget + new snapshot dispatch + skip-ahead) with a
+                // single long-hold ScreenFade. The fade-out is fired by the
+                // skip-ahead end (or directly by advanceToNextSegment when no
+                // skip is needed), so the black is held for the exact duration
+                // the next segment takes to ramp up.
+                sendFadeToBlack();
                 Bukkit.getScheduler().runTaskLater(this.plugin, this::advanceToNextSegment, 21L);
             } else {
                 finish("Trailer complete");
@@ -510,6 +542,9 @@ public class PlaybackSession {
             if (this.currentSegment.startTick() > 0) {
                 runSkipAheadPass();
             } else {
+                // No skip-ahead needed; the long-hold fade from the segment
+                // boundary needs an explicit fade-out before the scene starts.
+                sendFadeFromBlack();
                 scheduleTickTimer();
             }
         });
