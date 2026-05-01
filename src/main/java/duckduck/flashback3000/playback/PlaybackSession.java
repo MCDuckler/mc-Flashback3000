@@ -288,11 +288,14 @@ public class PlaybackSession {
      */
     private void sendBlackFade(int fadeInTicks, int stayTicks, int fadeOutTicks) {
         try {
-            // U+D47F: the same character Toolbox3000's ScreenFade uses; the CTA
-            // resource-pack font maps it to a full-screen black sprite.
+            // Match Toolbox3000.ScreenFade exactly: U+D47F + RGB(1,7,1) tint.
+            // The CTA resource pack ships a custom text shader that detects this
+            // specific tint and renders a diagonal-wipe full-screen black overlay
+            // driven by the title's fade alpha. Plain black does NOT trigger it.
             net.kyori.adventure.text.Component adv = net.kyori.adventure.text.Component
                     .text("푿")
-                    .color(net.kyori.adventure.text.format.NamedTextColor.BLACK);
+                    .color(net.kyori.adventure.text.format.TextColor.color(0x010701))
+                    .shadowColor(net.kyori.adventure.text.format.ShadowColor.none());
             net.minecraft.network.chat.Component nms = io.papermc.paper.adventure.PaperAdventure.asVanilla(adv);
             net.minecraft.network.chat.Component empty = net.minecraft.network.chat.Component.empty();
             // PlaybackPacket wrapper bypasses the active filter (player.showTitle
