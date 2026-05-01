@@ -69,13 +69,26 @@ public class PlaybackFilter extends ChannelDuplexHandler {
      * custom data slots above any vanilla entity's range.
      */
     private static boolean isDangerousForVanilla(Object msg) {
+        if (msg == null) return false;
+        if (isModelEngineWrapper(msg.getClass())) return true;
         if (msg instanceof ClientboundSetEntityDataPacket sed) return hasHighField(sed);
         if (msg instanceof BundlePacket<?> bp) {
             for (Packet<?> sub : bp.subPackets()) {
+                if (sub == null) continue;
+                if (isModelEngineWrapper(sub.getClass())) return true;
                 if (sub instanceof ClientboundSetEntityDataPacket sed && hasHighField(sed)) return true;
             }
         }
         return false;
+    }
+
+    private static boolean isModelEngineWrapper(Class<?> c) {
+        // ModelEngine emits its own Packet implementations (ProtectedPacket, etc.)
+        // for ME-aware clients. Those don't decode cleanly on vanilla clients and
+        // can produce malformed bytes / unknown packet ids / AIOOBE during the
+        // post-RESTORE entity-tracker re-engagement. Drop them wholesale for the
+        // viewer; they'll see the underlying armor-stand fallbacks instead.
+        return c.getName().startsWith("com.ticxo.modelengine.");
     }
 
     private static boolean hasHighField(ClientboundSetEntityDataPacket sed) {
