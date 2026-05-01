@@ -16,6 +16,10 @@ import net.minecraft.network.protocol.game.ClientGamePacketListener;
 import net.minecraft.network.protocol.game.ClientboundEntityPositionSyncPacket;
 import net.minecraft.network.protocol.game.ClientboundPlayerPositionPacket;
 import net.minecraft.network.protocol.game.ClientboundRotateHeadPacket;
+import net.minecraft.network.protocol.game.ClientboundSetDisplayObjectivePacket;
+import net.minecraft.network.protocol.game.ClientboundSetObjectivePacket;
+import net.minecraft.network.protocol.game.ClientboundSetPlayerTeamPacket;
+import net.minecraft.network.protocol.game.ClientboundSetScorePacket;
 import net.minecraft.network.protocol.game.GameProtocols;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerPlayer;
@@ -228,6 +232,9 @@ public class PlaybackSession {
                         && packet instanceof ClientboundPlayerPositionPacket) {
                     return;
                 }
+                if (this.plan != null && shouldDropForScene(packet)) {
+                    return;
+                }
                 send(packet);
             } else if (type.equals(LEVEL_CHUNK_CACHED)) {
                 FriendlyByteBuf buf = wrap(action.payload());
@@ -282,6 +289,20 @@ public class PlaybackSession {
 
     private static byte encodeAngle(float deg) {
         return (byte) Math.floor(deg * 256.0f / 360.0f);
+    }
+
+    /**
+     * Packets the recorder captures mid-stream that reference state the snapshot
+     * doesn't reconstruct. Letting them through during scene playback corrupts
+     * the client's local maps (e.g. team UPDATE with no prior ADD) and triggers
+     * a "Network Protocol Error" disconnect. None of these matter for a
+     * cinematic trailer, so drop them.
+     */
+    private static boolean shouldDropForScene(Packet<?> packet) {
+        return packet instanceof ClientboundSetPlayerTeamPacket
+                || packet instanceof ClientboundSetObjectivePacket
+                || packet instanceof ClientboundSetScorePacket
+                || packet instanceof ClientboundSetDisplayObjectivePacket;
     }
 
     @SuppressWarnings("unchecked")
