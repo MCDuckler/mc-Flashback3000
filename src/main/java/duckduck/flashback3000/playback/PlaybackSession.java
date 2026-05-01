@@ -34,7 +34,10 @@ import net.minecraft.network.protocol.game.ClientboundResetScorePacket;
 import net.minecraft.network.protocol.game.ClientboundRespawnPacket;
 import net.minecraft.network.protocol.game.ClientboundRotateHeadPacket;
 import net.minecraft.network.protocol.game.ClientboundSetCameraPacket;
+import net.minecraft.network.protocol.game.ClientboundSetChunkCacheCenterPacket;
+import net.minecraft.network.protocol.game.ClientboundSetChunkCacheRadiusPacket;
 import net.minecraft.network.protocol.game.ClientboundSetEntityDataPacket;
+import net.minecraft.network.protocol.game.ClientboundSetSimulationDistancePacket;
 import net.minecraft.network.protocol.game.ClientboundSetDisplayObjectivePacket;
 import net.minecraft.network.protocol.game.ClientboundSetObjectivePacket;
 import net.minecraft.network.protocol.game.ClientboundSetPlayerTeamPacket;
@@ -154,6 +157,11 @@ public class PlaybackSession {
             try {
                 wipeClientWorld();
                 this.currentChunk = this.replay.readChunk(this.replay.chunkOrder().get(0));
+                // Tell the client where its chunk-load center is and how big its
+                // view-distance window is, BEFORE the snapshot streams chunks.
+                // Without these the client doesn't know which chunks belong to
+                // its render area and stalls on "Loading terrain" indefinitely.
+                sendChunkCacheConfig();
                 this.dispatchSnapshot();
                 // Tell the client to switch from "Loading terrain" to in-game view.
                 // Recorder snapshot doesn't include this; PlayerList.sendLevelInfo
@@ -248,6 +256,19 @@ public class PlaybackSession {
         } catch (Throwable t) {
             this.plugin.getLogger().warning("wipeClientWorld failed (continuing): " + t);
         }
+    }
+
+    private void sendChunkCacheConfig() {
+        ParsedScenes.CameraSample first = this.plan != null && !this.plan.samples().isEmpty()
+                ? this.plan.samples().get(0) : null;
+        double cx = first != null ? first.x() : this.serverPlayer.getX();
+        double cz = first != null ? first.z() : this.serverPlayer.getZ();
+        int chunkX = (int) Math.floor(cx / 16.0);
+        int chunkZ = (int) Math.floor(cz / 16.0);
+        int viewDistance = Math.max(8, this.serverPlayer.requestedViewDistance());
+        send(new ClientboundSetChunkCacheCenterPacket(chunkX, chunkZ));
+        send(new ClientboundSetChunkCacheRadiusPacket(viewDistance));
+        send(new ClientboundSetSimulationDistancePacket(viewDistance));
     }
 
     private void tick() {
