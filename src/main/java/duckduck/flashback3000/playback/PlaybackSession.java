@@ -20,14 +20,18 @@ import net.minecraft.network.protocol.game.ClientboundContainerSetContentPacket;
 import net.minecraft.network.protocol.game.ClientboundContainerSetDataPacket;
 import net.minecraft.network.protocol.game.ClientboundContainerSetSlotPacket;
 import net.minecraft.network.protocol.game.ClientboundOpenScreenPacket;
+import net.minecraft.core.UUIDUtil;
+import net.minecraft.network.protocol.game.ClientboundAddEntityPacket;
 import net.minecraft.network.protocol.game.ClientboundEntityPositionSyncPacket;
 import net.minecraft.network.protocol.game.ClientboundGameEventPacket;
 import net.minecraft.network.protocol.game.ClientboundPlayerInfoRemovePacket;
 import net.minecraft.network.protocol.game.ClientboundPlayerInfoUpdatePacket;
 import net.minecraft.network.protocol.game.ClientboundPlayerPositionPacket;
+import net.minecraft.network.protocol.game.ClientboundRemoveEntitiesPacket;
 import net.minecraft.network.protocol.game.ClientboundResetScorePacket;
 import net.minecraft.network.protocol.game.ClientboundRespawnPacket;
 import net.minecraft.network.protocol.game.ClientboundRotateHeadPacket;
+import net.minecraft.network.protocol.game.ClientboundSetCameraPacket;
 import net.minecraft.network.protocol.game.ClientboundSetDisplayObjectivePacket;
 import net.minecraft.network.protocol.game.ClientboundSetObjectivePacket;
 import net.minecraft.network.protocol.game.ClientboundSetPlayerTeamPacket;
@@ -39,8 +43,9 @@ import net.minecraft.network.protocol.game.GameProtocols;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.network.ServerCommonPacketListenerImpl;
+import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.PositionMoveRotation;
-import net.minecraft.world.entity.Relative;
+import net.minecraft.world.level.GameType;
 import net.minecraft.world.phys.Vec3;
 import org.bukkit.Bukkit;
 import org.bukkit.craftbukkit.entity.CraftPlayer;
@@ -82,6 +87,14 @@ public class PlaybackSession {
     private boolean finished = false;
     private @Nullable BukkitTask task;
     private final Set<String> droppedClassesSeen = new HashSet<>();
+
+    // Camera anchor: an invisible MARKER entity the client interpolates between
+    // server EntityPositionSync updates. We lock the client's view to it via
+    // ClientboundSetCameraPacket. Player's own gamemode is switched to spectator
+    // during the scene so movement keys don't interfere visually.
+    private static final int CAMERA_ENTITY_ID_OFFSET = 0x4F3B0000;
+    private int cameraEntityId = -1;
+    private @Nullable GameType originalGameMode;
 
     public PlaybackSession(Flashback3000 plugin, Player bukkitPlayer, ReplayFile replay) {
         this(plugin, bukkitPlayer, replay, null, null);
@@ -139,6 +152,9 @@ public class PlaybackSession {
                 // Recorder snapshot doesn't include this; PlayerList.sendLevelInfo
                 // sends it on a regular join.
                 send(new ClientboundGameEventPacket(ClientboundGameEventPacket.LEVEL_CHUNKS_LOAD_START, 0.0F));
+                if (this.plan != null && this.plan.overrideCamera()) {
+                    installCameraAnchor();
+                }
                 this.snapshotSent = true;
             } catch (Throwable t) {
                 this.plugin.getLogger().severe("Failed to dispatch initial snapshot: " + t);
@@ -247,14 +263,66 @@ public class PlaybackSession {
     }
 
     private void sendCameraOverride(ParsedScenes.CameraSample sample) {
+        if (this.cameraEntityId < 0) return;
         PositionMoveRotation pmr = new PositionMoveRotation(
                 new Vec3(sample.x(), sample.y(), sample.z()),
                 Vec3.ZERO,
                 sample.yaw(),
                 sample.pitch());
-        ClientboundPlayerPositionPacket pkt = new ClientboundPlayerPositionPacket(
-                ++this.teleportSeq, pmr, Set.<Relative>of());
-        send(pkt);
+        // Client interpolates entity positions over a few ticks, so this is smooth
+        // even at 20Hz unlike a direct ClientboundPlayerPositionPacket which snaps.
+        send(new ClientboundEntityPositionSyncPacket(this.cameraEntityId, pmr, false));
+        FriendlyByteBuf rh = new FriendlyByteBuf(Unpooled.buffer());
+        rh.writeVarInt(this.cameraEntityId);
+        rh.writeByte(encodeAngle(sample.yaw()));
+        send(ClientboundRotateHeadPacket.STREAM_CODEC.decode(rh));
+    }
+
+    private void installCameraAnchor() {
+        ParsedScenes.CameraSample first = this.plan.samples().isEmpty() ? null : this.plan.samples().get(0);
+        double x = first != null ? first.x() : this.serverPlayer.getX();
+        double y = first != null ? first.y() : this.serverPlayer.getY();
+        double z = first != null ? first.z() : this.serverPlayer.getZ();
+        float yaw = first != null ? first.yaw() : this.serverPlayer.getYRot();
+        float pitch = first != null ? first.pitch() : this.serverPlayer.getXRot();
+
+        // Pick an entity id unlikely to collide with anything live. Hash the
+        // viewer uuid into the high bits so concurrent sessions don't clash.
+        this.cameraEntityId = CAMERA_ENTITY_ID_OFFSET
+                ^ (this.serverPlayer.getUUID().hashCode() & 0xFFFF);
+
+        send(new ClientboundAddEntityPacket(
+                this.cameraEntityId,
+                UUIDUtil.createOfflinePlayerUUID("FlashbackCam-" + this.cameraEntityId),
+                x, y, z, pitch, yaw,
+                EntityType.MARKER,
+                0,
+                Vec3.ZERO,
+                yaw));
+
+        // Lock client view to the marker.
+        FriendlyByteBuf cam = new FriendlyByteBuf(Unpooled.buffer());
+        cam.writeVarInt(this.cameraEntityId);
+        send(ClientboundSetCameraPacket.STREAM_CODEC.decode(cam));
+
+        this.originalGameMode = this.serverPlayer.gameMode.getGameModeForPlayer();
+        send(new ClientboundGameEventPacket(ClientboundGameEventPacket.CHANGE_GAME_MODE,
+                (float) GameType.SPECTATOR.getId()));
+    }
+
+    private void uninstallCameraAnchor() {
+        if (this.cameraEntityId < 0) return;
+        // Restore camera to the player.
+        FriendlyByteBuf cam = new FriendlyByteBuf(Unpooled.buffer());
+        cam.writeVarInt(this.serverPlayer.getId());
+        send(ClientboundSetCameraPacket.STREAM_CODEC.decode(cam));
+        // Despawn the marker.
+        send(new ClientboundRemoveEntitiesPacket(this.cameraEntityId));
+        // Restore game mode (defaults to SURVIVAL if we didn't capture original).
+        GameType restore = this.originalGameMode != null ? this.originalGameMode : GameType.SURVIVAL;
+        send(new ClientboundGameEventPacket(ClientboundGameEventPacket.CHANGE_GAME_MODE,
+                (float) restore.getId()));
+        this.cameraEntityId = -1;
     }
 
     private void advanceChunk() {
@@ -411,6 +479,12 @@ public class PlaybackSession {
             this.task = null;
         }
         try { this.replay.close(); } catch (Exception ignored) {}
+
+        // Hand camera back to the viewer's player and restore game mode while our
+        // PlaybackPacket path is still authoritative on the wire.
+        try { uninstallCameraAnchor(); } catch (Throwable t) {
+            this.plugin.getLogger().warning("Failed to uninstall camera anchor: " + t);
+        }
 
         EndBehavior end = this.plan != null ? this.plan.endBehavior() : EndBehavior.KICK;
         this.filter.setActive(false);
