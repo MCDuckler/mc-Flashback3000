@@ -41,7 +41,13 @@ public class PlaybackManager implements Listener {
         ReplayFile replay = new ReplayFile(replayPath);
         UUID viewerId = player.getUniqueId();
         PlaybackSession session = new PlaybackSession(this.plugin, player, replay, null,
-                () -> this.active.remove(viewerId));
+                () -> {
+                    this.active.remove(viewerId);
+                    if (player.isOnline() && this.plugin.getServerProtocol() != null) {
+                        this.plugin.getServerProtocol().sendPlaybackStatus(
+                                player, false, new UUID(0L, 0L), "", "Playback ended");
+                    }
+                });
         this.active.put(viewerId, session);
         session.start();
         return session;
@@ -66,7 +72,15 @@ public class PlaybackManager implements Listener {
         ReplayFile replay = new ReplayFile(entry.path());
         UUID viewerId = player.getUniqueId();
         PlaybackSession session = new PlaybackSession(this.plugin, player, replay, plan,
-                () -> this.active.remove(viewerId));
+                () -> {
+                    this.active.remove(viewerId);
+                    // Tell the mod the playback is no longer active so its UI
+                    // (Play buttons, "Busy" greying) returns to the idle state.
+                    if (player.isOnline() && this.plugin.getServerProtocol() != null) {
+                        this.plugin.getServerProtocol().sendPlaybackStatus(
+                                player, false, replayId, sceneId, "Scene ended");
+                    }
+                });
         this.active.put(viewerId, session);
         this.plugin.getLogger().info("Scene playback start: replay=" + replayId
                 + " scene=" + sceneId + " ticks=" + scene.startTick() + "-" + scene.endTick()
