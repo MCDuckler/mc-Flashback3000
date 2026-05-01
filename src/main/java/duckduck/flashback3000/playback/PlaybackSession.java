@@ -157,11 +157,6 @@ public class PlaybackSession {
             try {
                 wipeClientWorld();
                 this.currentChunk = this.replay.readChunk(this.replay.chunkOrder().get(0));
-                // Tell the client where its chunk-load center is and how big its
-                // view-distance window is, BEFORE the snapshot streams chunks.
-                // Without these the client doesn't know which chunks belong to
-                // its render area and stalls on "Loading terrain" indefinitely.
-                sendChunkCacheConfig();
                 this.dispatchSnapshot();
                 // Tell the client to switch from "Loading terrain" to in-game view.
                 // Recorder snapshot doesn't include this; PlayerList.sendLevelInfo
@@ -433,6 +428,12 @@ public class PlaybackSession {
                 // chunks without that envelope leaves the client stuck on the
                 // loading screen even after all chunks already arrived.
                 if (!this.loadStartSent && packet instanceof net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket) {
+                    // Chunk cache center/radius/simulation distance must be sent
+                    // AFTER LoginPacket (which resets client cache state) and
+                    // BEFORE chunks, otherwise the client doesn't know which
+                    // chunks fall in its render area and stalls on "Loading
+                    // terrain" even after all chunks arrived.
+                    sendChunkCacheConfig();
                     send(new ClientboundGameEventPacket(ClientboundGameEventPacket.LEVEL_CHUNKS_LOAD_START, 0.0F));
                     send(ClientboundChunkBatchStartPacket.INSTANCE);
                     this.loadStartSent = true;
@@ -457,6 +458,7 @@ public class PlaybackSession {
                 byte[] cached = this.replay.cachedChunk(idx);
                 Packet<? super ClientGamePacketListener> packet = decodeGame(cached);
                 if (!this.loadStartSent) {
+                    sendChunkCacheConfig();
                     send(new ClientboundGameEventPacket(ClientboundGameEventPacket.LEVEL_CHUNKS_LOAD_START, 0.0F));
                     send(ClientboundChunkBatchStartPacket.INSTANCE);
                     this.loadStartSent = true;
