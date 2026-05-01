@@ -90,6 +90,43 @@ public final class PlaybackApi {
         return future;
     }
 
+    /**
+     * Multi-segment playback: each entry is a (replayId, sceneId) pair from a
+     * possibly different recording. Played back-to-back with a wipe-Respawn +
+     * snapshot reload between each. Use {@link TrailerEntry#of} to build the
+     * list.
+     */
+    public CompletableFuture<Void> startTrailer(Player viewer,
+                                                List<TrailerEntry> entries,
+                                                ScenePlaybackOptions opts) {
+        CompletableFuture<Void> future = new CompletableFuture<>();
+        java.util.List<duckduck.flashback3000.playback.PlaybackManager.TrailerEntry> mapped =
+                new java.util.ArrayList<>(entries.size());
+        for (TrailerEntry e : entries) {
+            mapped.add(new duckduck.flashback3000.playback.PlaybackManager.TrailerEntry(e.replayId(), e.sceneId()));
+        }
+        Runnable run = () -> {
+            try {
+                this.manager.startTrailer(viewer, mapped, opts);
+                future.complete(null);
+            } catch (Throwable t) {
+                future.completeExceptionally(t);
+            }
+        };
+        if (Bukkit.isPrimaryThread()) {
+            run.run();
+        } else {
+            Bukkit.getScheduler().runTask(this.plugin, run);
+        }
+        return future;
+    }
+
+    public record TrailerEntry(UUID replayId, String sceneId) {
+        public static TrailerEntry of(UUID replayId, String sceneId) {
+            return new TrailerEntry(replayId, sceneId);
+        }
+    }
+
     public boolean cancel(Player viewer) {
         if (!this.manager.isPlaying(viewer)) return false;
         if (Bukkit.isPrimaryThread()) {

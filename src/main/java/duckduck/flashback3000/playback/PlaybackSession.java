@@ -83,11 +83,14 @@ public class PlaybackSession {
     private final Player bukkitPlayer;
     private final ServerPlayer serverPlayer;
     private final Channel channel;
-    private final ReplayFile replay;
+    private @Nullable ReplayFile replay;
     private final RegistryAccess registryAccess;
     private final StreamCodec<ByteBuf, Packet<? super ClientGamePacketListener>> gamePacketCodec;
     private PlaybackFilter filter;
-    private final @Nullable ScenePlan plan;
+    private final @Nullable TrailerPlan plan;
+    private int segmentIndex = 0;
+    private @Nullable TrailerPlan.TrailerSegment currentSegment;
+    private boolean originalGameModeCaptured = false;
     private final @Nullable Runnable onFinish;
 
     private int chunkIndex = 0;
@@ -112,12 +115,17 @@ public class PlaybackSession {
     private int cameraEntityId = -1;
     private @Nullable GameType originalGameMode;
 
+    // Boss bars the viewer was watching when the trailer started. We pull them
+    // off the player at start so their HUD chrome doesn't clutter the cinematic,
+    // and reattach at end so post-trailer play resumes with the same bars.
+    private final java.util.List<org.bukkit.boss.KeyedBossBar> savedBossBars = new java.util.ArrayList<>();
+
     public PlaybackSession(Flashback3000 plugin, Player bukkitPlayer, ReplayFile replay) {
         this(plugin, bukkitPlayer, replay, null, null);
     }
 
     public PlaybackSession(Flashback3000 plugin, Player bukkitPlayer, ReplayFile replay,
-                           @Nullable ScenePlan plan, @Nullable Runnable onFinish) {
+                           @Nullable TrailerPlan plan, @Nullable Runnable onFinish) {
         this.plugin = plugin;
         this.bukkitPlayer = bukkitPlayer;
         this.serverPlayer = ((CraftPlayer) bukkitPlayer).getHandle();
@@ -128,6 +136,9 @@ public class PlaybackSession {
                 .bind(RegistryFriendlyByteBuf.decorator(this.registryAccess)).codec();
         this.filter = new PlaybackFilter();
         this.plan = plan;
+        if (plan != null && !plan.segments().isEmpty()) {
+            this.currentSegment = plan.first();
+        }
         this.onFinish = onFinish;
     }
 
@@ -168,13 +179,11 @@ public class PlaybackSession {
                 this.finish("Failed to install filter");
                 return;
             }
+            clearViewerBossBars();
             try {
                 wipeClientWorld();
                 this.currentChunk = this.replay.readChunk(this.replay.chunkOrder().get(0));
                 this.dispatchSnapshot();
-                // Tell the client to switch from "Loading terrain" to in-game view.
-                // Recorder snapshot doesn't include this; PlayerList.sendLevelInfo
-                // sends it on a regular join.
                 if (this.plan != null && this.plan.overrideCamera()) {
                     installCameraAnchor();
                 }
@@ -184,7 +193,7 @@ public class PlaybackSession {
                 this.finish("Snapshot dispatch failed");
                 return;
             }
-            if (this.plan != null && this.plan.startTick() > 0) {
+            if (this.currentSegment != null && this.currentSegment.startTick() > 0) {
                 runSkipAheadPass();
             } else {
                 scheduleTickTimer();
@@ -195,11 +204,12 @@ public class PlaybackSession {
     /**
      * Sliced skip-ahead: dispatch up to SKIP_TICKS_PER_PASS ticks then yield the
      * netty event loop. Reschedules itself until {@code globalTick} reaches
-     * {@code plan.startTick()}, then hands off to the Bukkit per-tick task.
+     * the current segment's startTick, then hands off to the Bukkit per-tick
+     * task.
      */
     private void runSkipAheadPass() {
         if (this.finished) return;
-        int target = this.plan.startTick();
+        int target = this.currentSegment.startTick();
         try {
             int pass = 0;
             while (this.globalTick < target && pass < SKIP_TICKS_PER_PASS) {
@@ -258,6 +268,28 @@ public class PlaybackSession {
      * entity UUID collisions and stale-state mismatches with the recording's
      * mid-stream UPDATE actions.
      */
+    private void clearViewerBossBars() {
+        try {
+            var iter = org.bukkit.Bukkit.getBossBars();
+            while (iter.hasNext()) {
+                org.bukkit.boss.KeyedBossBar bar = iter.next();
+                if (bar.getPlayers().contains(this.bukkitPlayer)) {
+                    this.savedBossBars.add(bar);
+                    bar.removePlayer(this.bukkitPlayer);
+                }
+            }
+        } catch (Throwable t) {
+            this.plugin.getLogger().warning("Failed to clear boss bars: " + t);
+        }
+    }
+
+    private void restoreViewerBossBars() {
+        for (org.bukkit.boss.KeyedBossBar bar : this.savedBossBars) {
+            try { bar.addPlayer(this.bukkitPlayer); } catch (Throwable ignored) {}
+        }
+        this.savedBossBars.clear();
+    }
+
     private void wipeClientWorld() {
         try {
             var info = this.serverPlayer.createCommonSpawnInfo(this.serverPlayer.level());
@@ -268,8 +300,8 @@ public class PlaybackSession {
     }
 
     private void sendChunkCacheConfig() {
-        ParsedScenes.CameraSample first = this.plan != null && !this.plan.samples().isEmpty()
-                ? this.plan.samples().get(0) : null;
+        ParsedScenes.CameraSample first = this.currentSegment != null && !this.currentSegment.samples().isEmpty()
+                ? this.currentSegment.samples().get(0) : null;
         double cx = first != null ? first.x() : this.serverPlayer.getX();
         double cy = first != null ? first.y() : this.serverPlayer.getY();
         double cz = first != null ? first.z() : this.serverPlayer.getZ();
@@ -295,8 +327,14 @@ public class PlaybackSession {
 
     private void tick() {
         if (this.finished) return;
-        if (this.plan != null && this.globalTick > this.plan.endTick()) {
-            finish("Scene complete");
+        if (this.currentSegment != null && this.globalTick > this.currentSegment.endTick()) {
+            // Current segment finished. Advance to next or finish trailer.
+            if (this.task != null) { this.task.cancel(); this.task = null; }
+            if (this.plan != null && !this.plan.isLast(this.segmentIndex)) {
+                advanceToNextSegment();
+            } else {
+                finish("Trailer complete");
+            }
             return;
         }
         try {
@@ -311,14 +349,71 @@ public class PlaybackSession {
         }
     }
 
+    /**
+     * Close the current segment's replay file and load the next segment's,
+     * then re-do the wipe + snapshot + camera-anchor + skip-ahead pipeline so
+     * the new segment's world replaces the previous one cleanly. Entity-id
+     * collisions across recordings are eliminated by the wipe-Respawn.
+     */
+    private void advanceToNextSegment() {
+        if (this.finished) return;
+        try { if (this.replay != null) this.replay.close(); } catch (Exception ignored) {}
+        this.segmentIndex++;
+        this.currentSegment = this.plan.segments().get(this.segmentIndex);
+        try {
+            this.replay = new ReplayFile(this.currentSegment.replayPath());
+        } catch (Throwable t) {
+            this.plugin.getLogger().severe("Failed to open segment " + this.segmentIndex + ": " + t);
+            finish("Segment open failed");
+            return;
+        }
+        // Reset per-segment state. Camera-entity stays alive only on the
+        // client; client-side it gets wiped by the next Respawn so we re-spawn
+        // it via installCameraAnchor below.
+        this.chunkIndex = 0;
+        this.tickInChunk = 0;
+        this.globalTick = 0;
+        this.snapshotSent = false;
+        this.loadStartSent = false;
+        this.chunkBatchOpen = false;
+        this.snapshotChunkCount = 0;
+        this.cameraEntityId = -1;
+        this.droppedClassesSeen.clear();
+        this.plugin.getLogger().info("Trailer segment " + this.segmentIndex
+                + " start: replay=" + this.currentSegment.replayId()
+                + " scene=" + this.currentSegment.sceneId()
+                + " ticks=" + this.currentSegment.startTick() + "-" + this.currentSegment.endTick());
+        // Re-engage scene-mode dropping in case the filter went inactive.
+        this.filter.setActive(true);
+        this.channel.eventLoop().execute(() -> {
+            try {
+                wipeClientWorld();
+                this.currentChunk = this.replay.readChunk(this.replay.chunkOrder().get(0));
+                this.dispatchSnapshot();
+                if (this.plan.overrideCamera()) installCameraAnchor();
+                this.snapshotSent = true;
+            } catch (Throwable t) {
+                this.plugin.getLogger().severe("Failed to dispatch segment snapshot: " + t);
+                finish("Segment snapshot failed");
+                return;
+            }
+            if (this.currentSegment.startTick() > 0) {
+                runSkipAheadPass();
+            } else {
+                scheduleTickTimer();
+            }
+        });
+    }
+
     private void dispatchTick(boolean applyCameraOverride) {
         List<RawAction> tickActions = this.currentChunk.ticks().get(this.tickInChunk);
         this.tickInChunk++;
         for (RawAction action : tickActions) {
             dispatch(action);
         }
-        if (applyCameraOverride && this.plan != null && this.plan.overrideCamera()) {
-            ParsedScenes.CameraSample sample = this.plan.sampleAt(this.globalTick);
+        if (applyCameraOverride && this.plan != null && this.plan.overrideCamera()
+                && this.currentSegment != null) {
+            ParsedScenes.CameraSample sample = this.currentSegment.sampleAt(this.globalTick);
             if (sample != null) sendCameraOverride(sample);
         }
         this.globalTick++;
@@ -341,7 +436,8 @@ public class PlaybackSession {
     }
 
     private void installCameraAnchor() {
-        ParsedScenes.CameraSample first = this.plan.samples().isEmpty() ? null : this.plan.samples().get(0);
+        ParsedScenes.CameraSample first = this.currentSegment != null && !this.currentSegment.samples().isEmpty()
+                ? this.currentSegment.samples().get(0) : null;
         double x = first != null ? first.x() : this.serverPlayer.getX();
         double y = first != null ? first.y() : this.serverPlayer.getY();
         double z = first != null ? first.z() : this.serverPlayer.getZ();
@@ -378,7 +474,10 @@ public class PlaybackSession {
         cam.writeVarInt(this.cameraEntityId);
         send(ClientboundSetCameraPacket.STREAM_CODEC.decode(cam));
 
-        this.originalGameMode = this.serverPlayer.gameMode.getGameModeForPlayer();
+        if (!this.originalGameModeCaptured) {
+            this.originalGameMode = this.serverPlayer.gameMode.getGameModeForPlayer();
+            this.originalGameModeCaptured = true;
+        }
         send(new ClientboundGameEventPacket(ClientboundGameEventPacket.CHANGE_GAME_MODE,
                 (float) GameType.SPECTATOR.getId()));
     }
@@ -401,7 +500,14 @@ public class PlaybackSession {
     private void advanceChunk() {
         this.chunkIndex++;
         if (this.chunkIndex >= this.replay.chunkOrder().size()) {
-            this.finish(this.plan != null ? "Scene complete" : "Trailer complete");
+            // End of recording's tick stream. If we still have more segments
+            // queued, advance to the next; otherwise we're done.
+            if (this.task != null) { this.task.cancel(); this.task = null; }
+            if (this.plan != null && !this.plan.isLast(this.segmentIndex)) {
+                advanceToNextSegment();
+            } else {
+                finish(this.plan != null ? "Trailer complete" : "Replay complete");
+            }
             return;
         }
         try {
@@ -651,6 +757,10 @@ public class PlaybackSession {
         // PlaybackPacket path is still authoritative on the wire.
         try { uninstallCameraAnchor(); } catch (Throwable t) {
             this.plugin.getLogger().warning("Failed to uninstall camera anchor: " + t);
+        }
+        // Reattach any boss bars we pulled off at scene start.
+        try { restoreViewerBossBars(); } catch (Throwable t) {
+            this.plugin.getLogger().warning("Failed to restore boss bars: " + t);
         }
 
         EndBehavior end = this.plan != null ? this.plan.endBehavior() : EndBehavior.KICK;

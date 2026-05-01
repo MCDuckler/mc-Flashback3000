@@ -39,6 +39,7 @@ public final class PacketIds {
     public static final byte PLAY_SCENE_REQUEST = 0x60;
     public static final byte CANCEL_PLAYBACK = 0x61;
     public static final byte PLAYBACK_STATUS = 0x62;
+    public static final byte PLAY_TRAILER_REQUEST = 0x63;
 
     public static final byte END_RESTORE = 0x00;
     public static final byte END_KICK    = 0x01;

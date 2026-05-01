@@ -67,15 +67,16 @@ public class PlaybackManager implements Listener {
         if (!scene.isWellFormed()) {
             throw new IOException("Scene " + sceneId + " malformed");
         }
-        ScenePlan plan = new ScenePlan(scene.id(), scene.startTick(), scene.endTick(),
-                scene.samples(), opts.end(), opts.overrideCamera());
+        TrailerPlan.TrailerSegment segment = new TrailerPlan.TrailerSegment(
+                entry.path(), replayId, scene.id(),
+                scene.startTick(), scene.endTick(), scene.samples());
+        TrailerPlan plan = new TrailerPlan(java.util.List.of(segment),
+                opts.end(), opts.overrideCamera());
         ReplayFile replay = new ReplayFile(entry.path());
         UUID viewerId = player.getUniqueId();
         PlaybackSession session = new PlaybackSession(this.plugin, player, replay, plan,
                 () -> {
                     this.active.remove(viewerId);
-                    // Tell the mod the playback is no longer active so its UI
-                    // (Play buttons, "Busy" greying) returns to the idle state.
                     if (player.isOnline() && this.plugin.getServerProtocol() != null) {
                         this.plugin.getServerProtocol().sendPlaybackStatus(
                                 player, false, replayId, sceneId, "Scene ended");
@@ -88,6 +89,65 @@ public class PlaybackManager implements Listener {
         session.start();
         return session;
     }
+
+    /**
+     * Build a multi-segment {@link TrailerPlan} from a list of (replayId, sceneId)
+     * pairs. Each pair is resolved against the library + scene store. Throws if
+     * any pair is missing.
+     */
+    public PlaybackSession startTrailer(Player player,
+                                        java.util.List<TrailerEntry> entries,
+                                        ScenePlaybackOptions opts) throws IOException {
+        if (this.active.containsKey(player.getUniqueId())) {
+            throw new IllegalStateException("Already playing back for " + player.getName());
+        }
+        if (entries == null || entries.isEmpty()) {
+            throw new IOException("Trailer needs at least one segment");
+        }
+        java.util.List<TrailerPlan.TrailerSegment> segments = new java.util.ArrayList<>(entries.size());
+        for (TrailerEntry te : entries) {
+            ReplayLibrary.Entry entry = this.library.findById(te.replayId());
+            if (entry == null) throw new IOException("Replay not found: " + te.replayId());
+            ParsedScenes scenes = this.sceneStore.load(te.replayId());
+            if (scenes == null) throw new IOException("No scenes uploaded for replay " + te.replayId());
+            ParsedScenes.Scene scene = scenes.findById(te.sceneId())
+                    .orElseThrow(() -> new IOException("Scene not found: " + te.sceneId() + " in " + te.replayId()));
+            if (!scene.isWellFormed()) {
+                throw new IOException("Scene " + te.sceneId() + " malformed in " + te.replayId());
+            }
+            segments.add(new TrailerPlan.TrailerSegment(
+                    entry.path(), te.replayId(), scene.id(),
+                    scene.startTick(), scene.endTick(), scene.samples()));
+        }
+        TrailerPlan plan = new TrailerPlan(segments, opts.end(), opts.overrideCamera());
+        TrailerPlan.TrailerSegment first = plan.first();
+        ReplayFile replay = new ReplayFile(first.replayPath());
+        UUID viewerId = player.getUniqueId();
+        UUID firstReplayId = first.replayId();
+        String firstSceneId = first.sceneId();
+        PlaybackSession session = new PlaybackSession(this.plugin, player, replay, plan,
+                () -> {
+                    this.active.remove(viewerId);
+                    if (player.isOnline() && this.plugin.getServerProtocol() != null) {
+                        this.plugin.getServerProtocol().sendPlaybackStatus(
+                                player, false, firstReplayId, firstSceneId, "Trailer ended");
+                    }
+                });
+        this.active.put(viewerId, session);
+        StringBuilder log = new StringBuilder("Trailer playback start: viewer=").append(player.getName())
+                .append(" segments=").append(segments.size())
+                .append(" end=").append(opts.end()).append(" [");
+        for (int i = 0; i < segments.size(); i++) {
+            if (i > 0) log.append(", ");
+            log.append(segments.get(i).replayId()).append(':').append(segments.get(i).sceneId());
+        }
+        log.append(']');
+        this.plugin.getLogger().info(log.toString());
+        session.start();
+        return session;
+    }
+
+    public record TrailerEntry(UUID replayId, String sceneId) {}
 
     public @Nullable Path resolveReplay(String identifier) throws IOException {
         // Allow either a UUID or the bare filename (with or without .zip).

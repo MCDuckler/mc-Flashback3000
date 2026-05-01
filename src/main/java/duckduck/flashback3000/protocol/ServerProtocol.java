@@ -105,6 +105,7 @@ public class ServerProtocol implements PluginMessageListener, Listener {
             case PacketIds.UPLOAD_SCENES_END -> handleUploadEnd(player, Wire.readUUID(in));
             case PacketIds.LIST_SCENES -> handleListScenes(player, Wire.readUUID(in));
             case PacketIds.PLAY_SCENE_REQUEST -> handlePlayScene(player, Wire.readUUID(in), in.readUTF(), in.readByte());
+            case PacketIds.PLAY_TRAILER_REQUEST -> handlePlayTrailer(player, in);
             case PacketIds.CANCEL_PLAYBACK -> handleCancelPlayback(player);
             default -> this.plugin.getLogger().warning("Unknown opcode 0x" + Integer.toHexString(op & 0xFF));
         }
@@ -481,6 +482,35 @@ public class ServerProtocol implements PluginMessageListener, Listener {
                 sendPlaybackStatus(player, true, replayId, sceneId, "Playback started");
             } catch (Exception e) {
                 sendPlaybackStatus(player, false, replayId, sceneId, e.getMessage());
+            }
+        });
+    }
+
+    private void handlePlayTrailer(Player player, DataInputStream in) throws IOException {
+        if (!checkAdmin(player)) return;
+        byte endByte = in.readByte();
+        int count = in.readInt();
+        if (count < 0 || count > 64) {
+            sendPlaybackStatus(player, false, new UUID(0L, 0L), "", "Bad trailer length");
+            return;
+        }
+        java.util.List<duckduck.flashback3000.playback.PlaybackManager.TrailerEntry> entries = new java.util.ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            UUID replayId = Wire.readUUID(in);
+            String sceneId = in.readUTF();
+            entries.add(new duckduck.flashback3000.playback.PlaybackManager.TrailerEntry(replayId, sceneId));
+        }
+        EndBehavior end = endByte == PacketIds.END_KICK ? EndBehavior.KICK : EndBehavior.RESTORE;
+        ScenePlaybackOptions opts = new ScenePlaybackOptions(end, true);
+        UUID firstReplay = entries.isEmpty() ? new UUID(0L, 0L) : entries.get(0).replayId();
+        String firstScene = entries.isEmpty() ? "" : entries.get(0).sceneId();
+        Bukkit.getScheduler().runTask(this.plugin, () -> {
+            try {
+                this.plugin.getPlaybackManager().startTrailer(player, entries, opts);
+                sendPlaybackStatus(player, true, firstReplay, firstScene,
+                        "Trailer started (" + entries.size() + " segments)");
+            } catch (Exception e) {
+                sendPlaybackStatus(player, false, firstReplay, firstScene, e.getMessage());
             }
         });
     }
