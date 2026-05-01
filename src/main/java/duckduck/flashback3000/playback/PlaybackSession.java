@@ -311,18 +311,68 @@ public class PlaybackSession {
     }
 
     private void clearViewerBossBars() {
+        // Two sources of pre-existing bars: Bukkit KeyedBossBar (showable to
+        // a Player via addPlayer) and Adventure BossBar (player.showBossBar).
+        // The KeyedBossBar path needs to fire BEFORE the filter goes active,
+        // since removePlayer routes through the real-server path. Filter is
+        // already active by the time this is called, so we send the actual
+        // ClientboundBossEventPacket REMOVE wrapped in PlaybackPacket so it
+        // bypasses the filter — works for both kinds.
+        java.util.Set<java.util.UUID> ids = new java.util.HashSet<>();
         try {
             var iter = org.bukkit.Bukkit.getBossBars();
             while (iter.hasNext()) {
                 org.bukkit.boss.KeyedBossBar bar = iter.next();
                 if (bar.getPlayers().contains(this.bukkitPlayer)) {
                     this.savedBossBars.add(bar);
-                    bar.removePlayer(this.bukkitPlayer);
+                    // KeyedBossBar -> CraftBossBar wraps a ServerBossEvent whose
+                    // getId() is the wire UUID. Pull it via reflection to keep
+                    // this code compatible across CraftBukkit refactors.
+                    java.util.UUID id = extractKeyedBossBarUuid(bar);
+                    if (id != null) ids.add(id);
                 }
             }
         } catch (Throwable t) {
-            this.plugin.getLogger().warning("Failed to clear boss bars: " + t);
+            this.plugin.getLogger().warning("Failed to enumerate Keyed boss bars: " + t);
         }
+        try {
+            for (var advBar : this.bukkitPlayer.activeBossBars()) {
+                java.util.UUID id = extractAdventureBossBarUuid(advBar);
+                if (id != null) ids.add(id);
+            }
+        } catch (Throwable t) {
+            this.plugin.getLogger().warning("Failed to enumerate Adventure boss bars: " + t);
+        }
+        for (java.util.UUID id : ids) {
+            try {
+                this.channel.write(new PlaybackPacket(
+                        net.minecraft.network.protocol.game.ClientboundBossEventPacket.createRemovePacket(id)));
+            } catch (Throwable ignored) {}
+        }
+        this.channel.flush();
+    }
+
+    private static java.util.@org.jspecify.annotations.Nullable UUID extractKeyedBossBarUuid(org.bukkit.boss.KeyedBossBar bar) {
+        try {
+            // CraftBossBar.handle is the underlying ServerBossEvent
+            java.lang.reflect.Field f = bar.getClass().getDeclaredField("handle");
+            f.setAccessible(true);
+            Object handle = f.get(bar);
+            if (handle instanceof net.minecraft.world.BossEvent be) return be.getId();
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    private static java.util.@org.jspecify.annotations.Nullable UUID extractAdventureBossBarUuid(net.kyori.adventure.bossbar.BossBar bar) {
+        try {
+            var impl = net.kyori.adventure.bossbar.BossBarImplementation.get(bar,
+                    io.papermc.paper.adventure.BossBarImplementationImpl.class);
+            java.lang.reflect.Field f = impl.getClass().getDeclaredField("vanilla");
+            f.setAccessible(true);
+            Object handle = f.get(impl);
+            if (handle instanceof net.minecraft.world.BossEvent be) return be.getId();
+        } catch (Throwable ignored) {}
+        return null;
     }
 
     private void restoreViewerBossBars() {
