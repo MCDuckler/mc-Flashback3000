@@ -4,6 +4,7 @@ import net.minecraft.network.protocol.game.ClientboundChangeDifficultyPacket;
 import net.minecraft.network.protocol.game.ClientboundPlayerAbilitiesPacket;
 import net.minecraft.network.protocol.game.ClientboundRespawnPacket;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerChunkCache;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.players.PlayerList;
@@ -13,9 +14,15 @@ import net.minecraft.world.entity.Relative;
 import net.minecraft.world.level.storage.LevelData;
 import net.minecraft.world.phys.Vec3;
 
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.util.Collections;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 public final class PlayerStateRestore {
+
+    private static final Logger LOG = Logger.getLogger("Flashback3000-Restore");
 
     private PlayerStateRestore() {}
 
@@ -45,10 +52,11 @@ public final class PlayerStateRestore {
         level.addDuringTeleport(player);
 
         // 2a. Kick the chunk system so visible chunks + entity trackers re-broadcast.
-        // addDuringTeleport adds the player back to the ChunkMap, but ChunkMap.move
-        // is what actually walks the tracker set and pushes ClientboundLevelChunkWith*
-        // / AddEntity packets for everything in render distance.
-        level.getChunkSource().chunkMap.move(player);
+        // addDuringTeleport adds the player back to the ChunkMap, but ChunkMap.move is
+        // what actually walks the tracker set and pushes ClientboundLevelChunkWith* /
+        // AddEntity packets for everything in render distance. Done via reflection
+        // because some Paper builds rename the chunkMap field's declared type.
+        invokeChunkMapMove(level.getChunkSource(), player);
 
         // 3. Teleport to current real position so client snaps to server view.
         PositionMoveRotation pmr = new PositionMoveRotation(currentPos, Vec3.ZERO, yaw, pitch);
@@ -67,5 +75,33 @@ public final class PlayerStateRestore {
             player.containerMenu.broadcastFullState();
         }
         player.onUpdateAbilities();
+    }
+
+    private static void invokeChunkMapMove(ServerChunkCache cache, ServerPlayer player) {
+        Object chunkMap = null;
+        for (Field f : cache.getClass().getDeclaredFields()) {
+            if (f.getName().equals("chunkMap")) {
+                try {
+                    f.setAccessible(true);
+                    chunkMap = f.get(cache);
+                } catch (Throwable t) {
+                    LOG.log(Level.WARNING, "Could not access chunkMap field", t);
+                }
+                break;
+            }
+        }
+        if (chunkMap == null) {
+            LOG.warning("chunkMap field not found on ServerChunkCache; skipping re-track");
+            return;
+        }
+        try {
+            Method move = chunkMap.getClass().getMethod("move", ServerPlayer.class);
+            move.invoke(chunkMap, player);
+        } catch (NoSuchMethodException nsm) {
+            LOG.warning("chunkMap." + chunkMap.getClass().getSimpleName()
+                    + ".move(ServerPlayer) missing; chunks may not re-broadcast");
+        } catch (Throwable t) {
+            LOG.log(Level.WARNING, "chunkMap.move invocation failed", t);
+        }
     }
 }
