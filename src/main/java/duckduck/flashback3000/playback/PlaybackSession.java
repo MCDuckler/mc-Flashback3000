@@ -13,6 +13,7 @@ import net.minecraft.network.RegistryFriendlyByteBuf;
 import net.minecraft.network.codec.StreamCodec;
 import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.game.ClientGamePacketListener;
+import net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket;
 import net.minecraft.network.protocol.common.ClientboundKeepAlivePacket;
 import net.minecraft.network.protocol.game.ClientboundBossEventPacket;
 import net.minecraft.network.protocol.game.ClientboundChunkBatchFinishedPacket;
@@ -37,7 +38,11 @@ import net.minecraft.network.protocol.game.ClientboundSetCameraPacket;
 import net.minecraft.network.protocol.game.ClientboundSetChunkCacheCenterPacket;
 import net.minecraft.network.protocol.game.ClientboundSetChunkCacheRadiusPacket;
 import net.minecraft.network.protocol.game.ClientboundSetEntityDataPacket;
+import net.minecraft.network.protocol.game.ClientboundSetActionBarTextPacket;
 import net.minecraft.network.protocol.game.ClientboundSetSimulationDistancePacket;
+import net.minecraft.network.protocol.game.ClientboundSystemChatPacket;
+import net.minecraft.network.protocol.game.ClientboundPlayerChatPacket;
+import net.minecraft.network.protocol.game.ClientboundDisguisedChatPacket;
 import net.minecraft.network.protocol.game.ClientboundSetDisplayObjectivePacket;
 import net.minecraft.network.protocol.game.ClientboundSetObjectivePacket;
 import net.minecraft.network.protocol.game.ClientboundSetPlayerTeamPacket;
@@ -539,6 +544,12 @@ public class PlaybackSession {
         return (byte) Math.floor(deg * 256.0f / 360.0f);
     }
 
+    private static boolean isUltraCarsCameraPayload(Packet<?> packet) {
+        if (!(packet instanceof ClientboundCustomPayloadPacket cp)) return false;
+        var id = cp.payload().type().id();
+        return "ultracars3000".equals(id.getNamespace()) && "vehicle_camera".equals(id.getPath());
+    }
+
     /**
      * The recording can carry SetEntityData with field ids above any vanilla
      * entity's data-array length: server-side entity-id reuse makes mid-stream
@@ -580,6 +591,13 @@ public class PlaybackSession {
                 || packet instanceof ClientboundPlayerInfoRemovePacket
                 || packet instanceof ClientboundTabListPacket
                 || packet instanceof ClientboundUpdateAdvancementsPacket
+                // Chat / action-bar / boss-bar / UltraCars camera plugin-message:
+                // visual chrome that would distract from the trailer view.
+                || packet instanceof ClientboundSystemChatPacket
+                || packet instanceof ClientboundPlayerChatPacket
+                || packet instanceof ClientboundDisguisedChatPacket
+                || packet instanceof ClientboundSetActionBarTextPacket
+                || isUltraCarsCameraPayload(packet)
                 // Recorder sometimes captures attribute updates for non-living entities
                 // (Item Display, Block Display, etc). Vanilla client throws
                 // IllegalStateException on those. Drop wholesale for trailer use.
