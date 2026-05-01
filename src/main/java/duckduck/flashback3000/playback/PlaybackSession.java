@@ -86,6 +86,7 @@ public class PlaybackSession {
     private int teleportSeq = 0;
     private boolean snapshotSent = false;
     private boolean finished = false;
+    private boolean dispatchingSnapshot = false;
     private @Nullable BukkitTask task;
     private final Set<String> droppedClassesSeen = new HashSet<>();
 
@@ -210,8 +211,13 @@ public class PlaybackSession {
     }
 
     private void dispatchSnapshot() {
-        for (RawAction action : this.currentChunk.snapshot()) {
-            dispatch(action);
+        this.dispatchingSnapshot = true;
+        try {
+            for (RawAction action : this.currentChunk.snapshot()) {
+                dispatch(action);
+            }
+        } finally {
+            this.dispatchingSnapshot = false;
         }
     }
 
@@ -363,7 +369,7 @@ public class PlaybackSession {
                         && packet instanceof ClientboundPlayerPositionPacket) {
                     return;
                 }
-                if (this.plan != null && shouldDropForScene(packet)) {
+                if (this.plan != null && shouldDropForScene(packet, this.dispatchingSnapshot)) {
                     String name = packet.getClass().getSimpleName();
                     if (this.droppedClassesSeen.add(name)) {
                         this.plugin.getLogger().info("Scene playback dropped " + name + " (filter active)");
@@ -435,13 +441,13 @@ public class PlaybackSession {
      * Mid-stream UPDATE/REMOVE actions for those still slip in, so this drop
      * list keeps catching them without the cinematic trailer caring.
      */
-    private static boolean shouldDropForScene(Packet<?> packet) {
-        // Stateful packets the recorder snapshot doesn't reconstruct. Letting them
-        // through during scene playback corrupts the client's local maps (team /
-        // objective / boss-bar / tab-list / advancement / player-info) and the
-        // vanilla handler hits Map.get(name).method(...) -> NPE -> "Network
+    private static boolean shouldDropForScene(Packet<?> packet, boolean inSnapshot) {
+        // Always-drop: stateful packets the recorder snapshot doesn't reconstruct.
+        // Letting them through during scene playback corrupts the client's local
+        // maps (team / objective / boss-bar / tab-list / advancement / player-info)
+        // and the vanilla handler hits Map.get(name).method(...) -> NPE -> "Network
         // Protocol Error" disconnect. None matter for a cinematic trailer.
-        return packet instanceof ClientboundSetPlayerTeamPacket
+        if (packet instanceof ClientboundSetPlayerTeamPacket
                 || packet instanceof ClientboundSetObjectivePacket
                 || packet instanceof ClientboundSetScorePacket
                 || packet instanceof ClientboundResetScorePacket
@@ -466,7 +472,20 @@ public class PlaybackSession {
                 // Recorded keep-alives would make the client echo a stale id, which Paper
                 // checks against its own pending ping -> "out-of-order" disconnect. The
                 // real server keep-alive is allowed through the filter on write side.
-                || packet instanceof ClientboundKeepAlivePacket;
+                || packet instanceof ClientboundKeepAlivePacket) {
+            return true;
+        }
+
+        // Mid-stream-only drops: keep these for the snapshot (so entities have their
+        // initial state), drop them after snapshot finishes. Reason: server reuses
+        // entity ids over the recording window. If id 3903 was Type A at snapshot
+        // time and Type B mid-stream, the recorded SetEntityData carries fields
+        // that exceed Type A's field-array bounds -> AIOOBE -> kick.
+        if (!inSnapshot && packet instanceof ClientboundSetEntityDataPacket) {
+            return true;
+        }
+
+        return false;
     }
 
     @SuppressWarnings("unchecked")
