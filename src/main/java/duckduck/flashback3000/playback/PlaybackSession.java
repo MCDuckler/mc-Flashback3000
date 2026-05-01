@@ -21,6 +21,7 @@ import net.minecraft.network.protocol.game.ClientboundContainerSetDataPacket;
 import net.minecraft.network.protocol.game.ClientboundContainerSetSlotPacket;
 import net.minecraft.network.protocol.game.ClientboundOpenScreenPacket;
 import net.minecraft.network.protocol.game.ClientboundEntityPositionSyncPacket;
+import net.minecraft.network.protocol.game.ClientboundGameEventPacket;
 import net.minecraft.network.protocol.game.ClientboundPlayerInfoRemovePacket;
 import net.minecraft.network.protocol.game.ClientboundPlayerInfoUpdatePacket;
 import net.minecraft.network.protocol.game.ClientboundPlayerPositionPacket;
@@ -134,6 +135,10 @@ public class PlaybackSession {
                 wipeClientWorld();
                 this.currentChunk = this.replay.readChunk(this.replay.chunkOrder().get(0));
                 this.dispatchSnapshot();
+                // Tell the client to switch from "Loading terrain" to in-game view.
+                // Recorder snapshot doesn't include this; PlayerList.sendLevelInfo
+                // sends it on a regular join.
+                send(new ClientboundGameEventPacket(ClientboundGameEventPacket.LEVEL_CHUNKS_LOAD_START, 0.0F));
                 this.snapshotSent = true;
             } catch (Throwable t) {
                 this.plugin.getLogger().severe("Failed to dispatch initial snapshot: " + t);
