@@ -32,6 +32,7 @@ import net.minecraft.network.protocol.game.ClientboundResetScorePacket;
 import net.minecraft.network.protocol.game.ClientboundRespawnPacket;
 import net.minecraft.network.protocol.game.ClientboundRotateHeadPacket;
 import net.minecraft.network.protocol.game.ClientboundSetCameraPacket;
+import net.minecraft.network.protocol.game.ClientboundSetEntityDataPacket;
 import net.minecraft.network.protocol.game.ClientboundSetDisplayObjectivePacket;
 import net.minecraft.network.protocol.game.ClientboundSetObjectivePacket;
 import net.minecraft.network.protocol.game.ClientboundSetPlayerTeamPacket;
@@ -295,10 +296,21 @@ public class PlaybackSession {
                 this.cameraEntityId,
                 UUIDUtil.createOfflinePlayerUUID("FlashbackCam-" + this.cameraEntityId),
                 x, y, z, pitch, yaw,
-                EntityType.MARKER,
+                EntityType.ARMOR_STAND,
                 0,
                 Vec3.ZERO,
                 yaw));
+
+        // Set the armor stand to invisible (sharedFlags bit 5 = 0x20). The client
+        // still uses the entity for camera lock + interpolation, but the model and
+        // base plate are not rendered, so no plate/limbs clip into the camera view.
+        RegistryFriendlyByteBuf data = new RegistryFriendlyByteBuf(Unpooled.buffer(), this.registryAccess);
+        data.writeVarInt(this.cameraEntityId);
+        data.writeByte(0);            // field index 0 = sharedFlags
+        data.writeVarInt(0);          // serializer id 0 = BYTE
+        data.writeByte(0x20);         // invisible flag
+        data.writeByte(255);          // terminator
+        send(ClientboundSetEntityDataPacket.STREAM_CODEC.decode(data));
 
         // Lock client view to the marker.
         FriendlyByteBuf cam = new FriendlyByteBuf(Unpooled.buffer());
