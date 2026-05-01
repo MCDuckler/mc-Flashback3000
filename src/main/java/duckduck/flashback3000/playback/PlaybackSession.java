@@ -104,6 +104,11 @@ public class PlaybackSession {
     private boolean snapshotSent = false;
     private boolean finished = false;
     private boolean dispatchingSnapshot = false;
+    // True while the skip-ahead pass is replaying recording actions to the
+    // client to catch its world state up to scene startTick. send() uses
+    // write() (no flush) so the OS / netty batches the burst — flushing per
+    // packet adds ~one syscall per packet, which dominates skip-ahead time.
+    private boolean skippingAhead = false;
     private boolean loadStartSent = false;
     private boolean chunkBatchOpen = false;
     private int snapshotChunkCount = 0;
@@ -158,7 +163,10 @@ public class PlaybackSession {
         return this.bukkitPlayer;
     }
 
-    private static final int SKIP_TICKS_PER_PASS = 200;
+    // 50 ms event-loop budget per skip pass. With per-packet flush removed
+    // (see skippingAhead) the loop is CPU-bound on packet decode, so a
+    // time-budget bound is more appropriate than a fixed tick count.
+    private static final long SKIP_BUDGET_NANOS = 50_000_000L;
 
     public void start() {
         PlaybackFilter.resetTrace();
@@ -229,22 +237,29 @@ public class PlaybackSession {
     private void runSkipAheadPass() {
         if (this.finished) return;
         int target = this.currentSegment.startTick();
+        this.skippingAhead = true;
+        long deadline = System.nanoTime() + SKIP_BUDGET_NANOS;
         try {
-            int pass = 0;
-            while (this.globalTick < target && pass < SKIP_TICKS_PER_PASS) {
+            while (this.globalTick < target) {
                 if (this.tickInChunk >= this.currentChunk.ticks().size()) {
                     advanceChunk();
                     if (this.finished) return;
                     continue;
                 }
                 dispatchTick(false);
-                pass++;
+                if (System.nanoTime() >= deadline) break;
             }
         } catch (Throwable t) {
             this.plugin.getLogger().severe("Skip-ahead failed: " + t);
+            this.skippingAhead = false;
+            this.channel.flush();
             this.finish("Skip-ahead failed");
             return;
         }
+        // Flush whatever was buffered during this pass so the client can keep
+        // chewing through it while the next pass runs.
+        this.skippingAhead = false;
+        this.channel.flush();
         if (this.finished) return;
         if (this.globalTick < target) {
             this.channel.eventLoop().execute(this::runSkipAheadPass);
@@ -940,7 +955,11 @@ public class PlaybackSession {
     }
 
     private void send(Packet<?> packet) {
-        this.channel.writeAndFlush(new PlaybackPacket(packet));
+        if (this.skippingAhead) {
+            this.channel.write(new PlaybackPacket(packet));
+        } else {
+            this.channel.writeAndFlush(new PlaybackPacket(packet));
+        }
     }
 
     public void finish(String reason) {
