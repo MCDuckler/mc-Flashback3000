@@ -15,6 +15,11 @@ import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.game.ClientGamePacketListener;
 import net.minecraft.network.protocol.common.ClientboundKeepAlivePacket;
 import net.minecraft.network.protocol.game.ClientboundBossEventPacket;
+import net.minecraft.network.protocol.game.ClientboundContainerClosePacket;
+import net.minecraft.network.protocol.game.ClientboundContainerSetContentPacket;
+import net.minecraft.network.protocol.game.ClientboundContainerSetDataPacket;
+import net.minecraft.network.protocol.game.ClientboundContainerSetSlotPacket;
+import net.minecraft.network.protocol.game.ClientboundOpenScreenPacket;
 import net.minecraft.network.protocol.game.ClientboundEntityPositionSyncPacket;
 import net.minecraft.network.protocol.game.ClientboundPlayerInfoRemovePacket;
 import net.minecraft.network.protocol.game.ClientboundPlayerInfoUpdatePacket;
@@ -332,6 +337,14 @@ public class PlaybackSession {
                 // (Item Display, Block Display, etc). Vanilla client throws
                 // IllegalStateException on those. Drop wholesale for trailer use.
                 || packet instanceof ClientboundUpdateAttributesPacket
+                // Container packets can crash with AIOOBE when the recorded container's
+                // slot count differs from the viewer's open menu (or no menu is open).
+                // Trailers don't need GUIs to render, drop wholesale.
+                || packet instanceof ClientboundContainerSetContentPacket
+                || packet instanceof ClientboundContainerSetSlotPacket
+                || packet instanceof ClientboundContainerSetDataPacket
+                || packet instanceof ClientboundContainerClosePacket
+                || packet instanceof ClientboundOpenScreenPacket
                 // Recorded keep-alives would make the client echo a stale id, which Paper
                 // checks against its own pending ping -> "out-of-order" disconnect. The
                 // real server keep-alive is allowed through the filter on write side.
