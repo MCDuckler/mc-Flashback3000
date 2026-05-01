@@ -81,7 +81,7 @@ public class PlaybackSession {
     private final ReplayFile replay;
     private final RegistryAccess registryAccess;
     private final StreamCodec<ByteBuf, Packet<? super ClientGamePacketListener>> gamePacketCodec;
-    private final PlaybackFilter filter;
+    private PlaybackFilter filter;
     private final @Nullable ScenePlan plan;
     private final @Nullable Runnable onFinish;
 
@@ -136,7 +136,8 @@ public class PlaybackSession {
         PlaybackFilter.resetTrace();
         this.channel.eventLoop().execute(() -> {
             try {
-                if (this.channel.pipeline().get(PlaybackFilter.NAME) == null) {
+                PlaybackFilter existing = (PlaybackFilter) this.channel.pipeline().get(PlaybackFilter.NAME);
+                if (existing == null) {
                     // Install at the very tail so the filter intercepts outbound writes
                     // BEFORE the unbundler splits server bundles into delimiter+sub
                     // sequences. Packet bundles emitted by ServerEntity tracking arrive
@@ -149,6 +150,13 @@ public class PlaybackSession {
                     // fine — recorded keep-alives are already suppressed at dispatch
                     // and plugin messages still reach ServerProtocol via packet_handler.
                     this.channel.pipeline().addLast(PlaybackFilter.NAME, this.filter);
+                } else {
+                    // Filter from a previous session is still installed (we leave it
+                    // in place permanently as a vanilla-safety net). Reuse it and
+                    // re-activate scene-mode dropping; otherwise active=false from the
+                    // last session lets real-server bundles flow during this scene.
+                    existing.setActive(true);
+                    this.filter = existing;
                 }
             } catch (Throwable t) {
                 this.plugin.getLogger().severe("Failed to install playback filter: " + t);
