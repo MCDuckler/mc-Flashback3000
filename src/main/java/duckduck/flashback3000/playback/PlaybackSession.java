@@ -747,6 +747,19 @@ public class PlaybackSession {
                 if (this.segmentIndex > 0 && packet instanceof ClientboundLoginPacket) {
                     return;
                 }
+                // During skip-ahead the catch-up flush bursts hundreds of
+                // recorded sounds and particles to the client all at once,
+                // which the user hears as a cacophony and sees as a particle
+                // smear behind the wipe. Drop both kinds during the skip — the
+                // scene proper plays its own at normal cadence after.
+                if (this.skippingAhead && (
+                        packet instanceof net.minecraft.network.protocol.game.ClientboundSoundPacket
+                        || packet instanceof net.minecraft.network.protocol.game.ClientboundSoundEntityPacket
+                        || packet instanceof net.minecraft.network.protocol.game.ClientboundStopSoundPacket
+                        || packet instanceof net.minecraft.network.protocol.game.ClientboundLevelParticlesPacket
+                        || packet instanceof net.minecraft.network.protocol.game.ClientboundLevelEventPacket)) {
+                    return;
+                }
                 if (this.plan != null && shouldDropForScene(packet, this.dispatchingSnapshot)) {
                     String name = packet.getClass().getSimpleName();
                     if (this.droppedClassesSeen.add(name)) {
