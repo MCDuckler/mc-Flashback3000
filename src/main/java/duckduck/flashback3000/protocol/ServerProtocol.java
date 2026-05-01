@@ -49,6 +49,16 @@ public class ServerProtocol implements PluginMessageListener, Listener {
         Bukkit.getMessenger().registerOutgoingPluginChannel(this.plugin, PacketIds.CHANNEL);
         Bukkit.getMessenger().registerIncomingPluginChannel(this.plugin, PacketIds.CHANNEL, this);
         Bukkit.getPluginManager().registerEvents(this, this.plugin);
+        Bukkit.getScheduler().runTaskTimer(this.plugin, this::broadcastStatusToActive, 20L, 20L);
+    }
+
+    private void broadcastStatusToActive() {
+        Map<UUID, Recorder> active = this.plugin.getRecordingManager().activeRecorders();
+        if (active.isEmpty()) return;
+        for (UUID uuid : active.keySet()) {
+            Player p = Bukkit.getPlayer(uuid);
+            if (p != null && p.isOnline()) sendRecordingStatus(p);
+        }
     }
 
     public void shutdown() {
