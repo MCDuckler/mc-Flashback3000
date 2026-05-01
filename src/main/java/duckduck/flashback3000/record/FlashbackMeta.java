@@ -21,6 +21,7 @@ public class FlashbackMeta {
     public String versionString = null;
     public String worldName = null;
     public String bobbyWorldName = null;
+    public String voxyStoragePath = null;
     public int dataVersion = 0;
     public int protocolVersion = 0;
 
@@ -43,6 +44,7 @@ public class FlashbackMeta {
         if (this.dataVersion != 0) meta.addProperty("data_version", this.dataVersion);
         if (this.protocolVersion != 0) meta.addProperty("protocol_version", this.protocolVersion);
         if (this.bobbyWorldName != null) meta.addProperty("bobby_world_name", this.bobbyWorldName);
+        if (this.voxyStoragePath != null) meta.addProperty("voxy_storage_path", this.voxyStoragePath);
         if (this.totalTicks > 0) meta.addProperty("total_ticks", this.totalTicks);
 
         if (!this.replayMarkers.isEmpty()) {

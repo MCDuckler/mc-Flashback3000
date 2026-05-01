@@ -1,0 +1,17 @@
+# Absolute path to the playback CLIENT's voxy storage directory.
+# When set, written to each recording's metadata.json as `voxy_storage_path` so voxy's
+# Flashback compat reads pre-populated LOD data on playback (LOD chunks visible from far away).
+#
+# Constraint: this is the PLAYBACK MACHINE's filesystem path, not the server's. If your viewers
+# all share a layout (e.g., a workshop where everyone runs vanilla launcher with the same user
+# home), you can set it once here. Otherwise leave it empty and tell users to hand-edit
+# metadata.json inside the .zip after download to match their machine.
+#
+# Examples:
+#   voxy-storage-path: "/home/USER/.minecraft/.voxy"
+#   voxy-storage-path: "C:/Users/USER/AppData/Roaming/.minecraft/.voxy"
+#
+# Voxy will look up <voxy-storage-path>/<world_id>/storage/ at playback time. The world_id is
+# derived from playback context, so the user must already have voxy data for the matching server
+# under that base path.
+voxy-storage-path: ""

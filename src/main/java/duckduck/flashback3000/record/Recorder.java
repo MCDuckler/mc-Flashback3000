@@ -130,6 +130,11 @@ public class Recorder {
         this.metadata.protocolVersion = SharedConstants.getProtocolVersion();
         this.metadata.versionString = SharedConstants.getCurrentVersion().name();
         this.metadata.worldName = bukkitPlayer.getWorld().getName();
+
+        String configuredVoxyPath = Flashback3000.getInstance().getConfig().getString("voxy-storage-path", "");
+        if (configuredVoxyPath != null && !configuredVoxyPath.isBlank()) {
+            this.metadata.voxyStoragePath = configuredVoxyPath;
+        }
     }
 
     public Path recordFolder() {

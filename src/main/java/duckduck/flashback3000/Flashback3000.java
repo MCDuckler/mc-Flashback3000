@@ -37,6 +37,7 @@ public final class Flashback3000 extends JavaPlugin implements Listener {
     @Override
     public void onEnable() {
         instance = this;
+        saveDefaultConfig();
         ActionRegistry.bootstrap();
 
         // Register the cache manager FIRST so its PlayerJoinEvent listener catches every join.
