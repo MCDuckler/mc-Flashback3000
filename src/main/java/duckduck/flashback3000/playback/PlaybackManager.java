@@ -69,7 +69,7 @@ public class PlaybackManager implements Listener {
         }
         TrailerPlan.TrailerSegment segment = new TrailerPlan.TrailerSegment(
                 entry.path(), replayId, scene.id(),
-                scene.startTick(), scene.endTick(), scene.samples());
+                scene.startTick(), scene.endTick(), scene.samples(), scene.textDisplays());
         TrailerPlan plan = new TrailerPlan(java.util.List.of(segment),
                 opts.end(), opts.overrideCamera());
         ReplayFile replay = new ReplayFile(entry.path());
@@ -117,7 +117,7 @@ public class PlaybackManager implements Listener {
             }
             segments.add(new TrailerPlan.TrailerSegment(
                     entry.path(), te.replayId(), scene.id(),
-                    scene.startTick(), scene.endTick(), scene.samples()));
+                    scene.startTick(), scene.endTick(), scene.samples(), scene.textDisplays()));
         }
         TrailerPlan plan = new TrailerPlan(segments, opts.end(), opts.overrideCamera());
         TrailerPlan.TrailerSegment first = plan.first();

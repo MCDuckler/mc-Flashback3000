@@ -122,6 +122,7 @@ public class PlaybackSession {
     private static final int CAMERA_ENTITY_ID_OFFSET = 0x4F3B0000;
     private int cameraEntityId = -1;
     private @Nullable GameType originalGameMode;
+    private @Nullable SceneTextDisplayManager textDisplays;
 
     // Boss bars the viewer was watching when the trailer started. We pull them
     // off the player at start so their HUD chrome doesn't clutter the cinematic,
@@ -610,6 +611,10 @@ public class PlaybackSession {
             }
             this.liveChunks.clear();
         }
+        if (this.textDisplays != null) {
+            this.textDisplays.clear();
+            this.textDisplays = null;
+        }
     }
 
     private void dispatchTick(boolean applyCameraOverride) {
@@ -622,6 +627,12 @@ public class PlaybackSession {
                 && this.currentSegment != null) {
             ParsedScenes.CameraSample sample = this.currentSegment.sampleAt(this.globalTick);
             if (sample != null) sendCameraOverride(sample);
+        }
+        if (this.currentSegment != null && !this.currentSegment.textDisplays().isEmpty()) {
+            if (this.textDisplays == null) {
+                this.textDisplays = new SceneTextDisplayManager(this.plugin, this.bukkitPlayer.getWorld());
+            }
+            this.textDisplays.onTick(this.globalTick, this.currentSegment.textDisplays());
         }
         this.globalTick++;
     }
@@ -998,6 +1009,10 @@ public class PlaybackSession {
             this.task = null;
         }
         try { this.replay.close(); } catch (Exception ignored) {}
+        if (this.textDisplays != null) {
+            this.textDisplays.clear();
+            this.textDisplays = null;
+        }
 
         // Hand camera back to the viewer's player and restore game mode while our
         // PlaybackPacket path is still authoritative on the wire.

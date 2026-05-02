@@ -72,13 +72,67 @@ public final class ParsedScenes {
                                 so.get("pitch").getAsFloat()));
                     }
                 }
-                scenes.add(new Scene(id, name, startTick, endTick, samples));
+                List<TextDisplay> textDisplays = new ArrayList<>();
+                JsonArray td = obj.has("textDisplays") ? obj.getAsJsonArray("textDisplays") : null;
+                if (td != null) {
+                    for (JsonElement te : td) {
+                        textDisplays.add(parseTextDisplay(te.getAsJsonObject()));
+                    }
+                }
+                scenes.add(new Scene(id, name, startTick, endTick, samples, textDisplays));
             }
         }
         return new ParsedScenes(version, replayUuid, scenes);
     }
 
-    public record Scene(String id, String name, int startTick, int endTick, List<CameraSample> samples) {
+    private static TextDisplay parseTextDisplay(JsonObject o) {
+        return new TextDisplay(
+                o.get("id").getAsString(),
+                o.get("startTick").getAsInt(),
+                o.get("endTick").getAsInt(),
+                o.has("text") ? o.get("text").getAsString() : "",
+                o.get("x").getAsDouble(),
+                o.get("y").getAsDouble(),
+                o.get("z").getAsDouble(),
+                o.get("yaw").getAsFloat(),
+                o.get("pitch").getAsFloat(),
+                readFloats(o, "translation", new float[]{0, 0, 0}),
+                readFloats(o, "leftRotation", new float[]{0, 0, 0}),
+                readFloats(o, "scale", new float[]{1, 1, 1}),
+                readFloats(o, "rightRotation", new float[]{0, 0, 0}),
+                o.has("billboard") ? o.get("billboard").getAsString() : "CENTER",
+                o.has("backgroundColor") ? o.get("backgroundColor").getAsInt() : 0x40000000,
+                (byte) (o.has("textOpacity") ? o.get("textOpacity").getAsInt() : -1),
+                o.has("lineWidth") ? o.get("lineWidth").getAsInt() : 200,
+                o.has("shadow") && o.get("shadow").getAsBoolean(),
+                o.has("seeThrough") && o.get("seeThrough").getAsBoolean(),
+                o.has("defaultBackground") && o.get("defaultBackground").getAsBoolean(),
+                o.has("alignment") ? o.get("alignment").getAsString() : "CENTER",
+                o.has("viewRange") ? o.get("viewRange").getAsFloat() : 1.0f,
+                o.has("shadowRadius") ? o.get("shadowRadius").getAsFloat() : 0f,
+                o.has("shadowStrength") ? o.get("shadowStrength").getAsFloat() : 1.0f,
+                o.has("glowColorOverride") ? o.get("glowColorOverride").getAsInt() : -1
+        );
+    }
+
+    private static float[] readFloats(JsonObject o, String key, float[] fallback) {
+        if (!o.has(key) || !o.get(key).isJsonArray()) return fallback;
+        JsonArray a = o.getAsJsonArray(key);
+        if (a.size() < fallback.length) return fallback;
+        float[] out = new float[fallback.length];
+        for (int i = 0; i < fallback.length; i++) out[i] = a.get(i).getAsFloat();
+        return out;
+    }
+
+    public record TextDisplay(String id, int startTick, int endTick, String text,
+                              double x, double y, double z, float yaw, float pitch,
+                              float[] translation, float[] leftRotation, float[] scale, float[] rightRotation,
+                              String billboard, int backgroundColor, byte textOpacity, int lineWidth,
+                              boolean shadow, boolean seeThrough, boolean defaultBackground, String alignment,
+                              float viewRange, float shadowRadius, float shadowStrength, int glowColorOverride) {}
+
+    public record Scene(String id, String name, int startTick, int endTick,
+                        List<CameraSample> samples, List<TextDisplay> textDisplays) {
         public int expectedSampleCount() {
             return Math.max(0, this.endTick - this.startTick + 1);
         }

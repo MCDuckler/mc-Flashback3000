@@ -32,7 +32,8 @@ public record TrailerPlan(List<TrailerSegment> segments,
                                  String sceneId,
                                  int startTick,
                                  int endTick,
-                                 List<ParsedScenes.CameraSample> samples) {
+                                 List<ParsedScenes.CameraSample> samples,
+                                 List<ParsedScenes.TextDisplay> textDisplays) {
 
         public ParsedScenes.CameraSample sampleAt(int globalTick) {
             int idx = globalTick - this.startTick;
